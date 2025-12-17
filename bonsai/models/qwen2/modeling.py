@@ -14,7 +14,6 @@
 
 import dataclasses
 import math
-from typing import TypeAlias
 
 import jax
 from flax import nnx
