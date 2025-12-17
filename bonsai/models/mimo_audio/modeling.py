@@ -12,7 +12,6 @@ from bonsai.models.qwen2.modeling import Qwen2, ModelConfig as Qwen2Config, Cach
 class MiMoAudioConfig:
     """Configuration for MiMo Audio Model"""
 
-    # Base model config (Qwen2-like)
     vocab_size: int = 151936
     hidden_size: int = 1536
     num_hidden_layers: int = 28
@@ -632,27 +631,6 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         return input_ids
 
 
-def create_mimo_audio_model(
-        config: MiMoAudioConfig,
-        args: MiMoAudioArguments,
-        rngs: Optional[nnx.Rngs] = None
-) -> FlaxMiMoAudioForCausalLM:
-    """
-    Factory function to create MiMo Audio model.
-
-    Args:
-        config: Model configuration
-        args: Special token arguments
-        rngs: Random number generators
-
-    Returns:
-        Initialized model
-    """
-    if rngs is None:
-        rngs = nnx.Rngs(0)
-
-    return FlaxMiMoAudioForCausalLM(config, args, rngs)
-
 
 # Example usage:
 if __name__ == "__main__":
@@ -669,7 +647,7 @@ if __name__ == "__main__":
     )
 
     # Create model
-    model = create_mimo_audio_model(config, args)
+    model = FlaxMiMoAudioForCausalLM(config,args)
 
     print("Model created successfully!")
     print(f"Audio channels: {model.audio_channels}")

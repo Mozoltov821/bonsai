@@ -137,7 +137,7 @@ def _get_key_mapping(config: model_lib.MiMoAudioTokenizerConfig) -> dict[str, tu
     return mapping
 
 
-def _torch_key_to_jax_key(
+def _get_jax_key(
     mapping: dict[str, tuple[str, Transform]], source_key: str
 ) -> tuple[str | None, Transform | None]:
     for pat, (jax_key, transform) in mapping.items():
@@ -196,7 +196,7 @@ def load_tokenizer_weights_from_safetensors(
 
     with safe_open(safetensors_path, framework="numpy") as sf:
         for torch_key in sf.keys():
-            jax_key, transform = _torch_key_to_jax_key(key_mapping, torch_key)
+            jax_key, transform = _get_jax_key(key_mapping, torch_key)
             if jax_key is None:
                 skipped_keys.append(torch_key)
                 continue

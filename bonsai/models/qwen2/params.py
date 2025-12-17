@@ -1,24 +1,9 @@
-# Copyright 2025 The JAX Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import gc
 import re
 from dataclasses import dataclass
 from typing import Any
 
 import jax
-import jax.numpy as jnp
 import safetensors
 from etils import epath
 from flax import nnx
@@ -60,7 +45,7 @@ def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig) -> dict[str, tupl
     }
 
 
-def _torch_key_to_jax_key(
+def _get_jax_key(
     mapping: dict[str, tuple[str | None, Transform | None]], source_key: str
 ) -> tuple[str | None, Transform | None]:
     for pat, (repl, transform) in mapping.items():
@@ -125,7 +110,7 @@ def create_model_from_safe_tensors(
     for f in files:
         with safetensors.safe_open(f, framework="numpy") as sf:
             for torch_key in sf.keys():
-                jax_key, transform = _torch_key_to_jax_key(key_mapping, torch_key)
+                jax_key, transform = _get_jax_key(key_mapping, torch_key)
                 if jax_key is None:
                     continue
 
