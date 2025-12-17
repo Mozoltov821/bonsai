@@ -192,7 +192,7 @@ class RotaryEmbedding(nnx.Module):
         self.dtype = dtype
         half_dim = dim // 2
         inv_freq = 1.0 / (self.base ** (jnp.arange(0, half_dim, dtype=jnp.float32) / float(half_dim)))
-        self.inv_freq = inv_freq
+        self.inv_freq = nnx.Param(inv_freq)
         self.attention_scaling = 1.0
 
     def __call__(self, hidden_states: Array, position_ids: Array) -> Tuple[Array, Array]:
@@ -260,7 +260,7 @@ class ISTFT(nnx.Module):
         self.hop_length = hop_length
         self.win_length = win_length
         self.padding = padding
-        self.window = jnp.hanning(win_length).astype(dtype)
+        self.window = nnx.Param(jnp.hanning(win_length).astype(dtype))
         self.pad = (self.win_length - self.hop_length) // 2 if padding == "same" else 0
 
     def __call__(self, spec: Array) -> Array:
@@ -406,11 +406,12 @@ class ResidualVectorQuantizer(nnx.Module):
                  rngs: Optional[nnx.Rngs] = None):
         self.dimension = dimension
         self.n_q = n_q
-        self.codebooks = []
+        codebooks_list = []
         for i in range(n_q):
             size = bins[min(i, len(bins) - 1)]
             embed = jnp.zeros((size, dimension), dtype=dtype)
-            self.codebooks.append(nnx.Param(embed))
+            codebooks_list.append(nnx.Param(embed))
+        self.codebooks = nnx.List(codebooks_list)
 
     def encode(self, hidden_states: Array, mask: Optional[Array] = None, n_q: Optional[int] = None) -> Tuple[
         Array, Array]:
@@ -452,12 +453,12 @@ class AudioEncoder(nnx.Module):
                                                   config.max_audio_seconds * config.sampling_rate // config.hop_length,
                                                   config.rope_type, dtype=dtype)
         act = _default_activation(config.activation_function)
-        self.layers = [
+        self.layers = nnx.List([
             TransformerLayer(act, config.d_model, config.encoder_attention_heads, config.encoder_ffn_dim,
                              config.encoder_causal, config.ln_type, tuple(config.encoder_attn_window_size), dtype=dtype,
                              rngs=rngs)
             for _ in range(config.encoder_layers)
-        ]
+        ])
         self.layer_norm = build_norm(config.ln_type, config.d_model, dtype, rngs)
         if config.avg_pooler != 1:
             self.down_sample_layer = Conv1d(config.d_model, config.d_model, kernel_size=config.avg_pooler,
@@ -545,11 +546,11 @@ class TransformerVocos(nnx.Module):
                                                   config.max_audio_seconds * config.sampling_rate // config.hop_length,
                                                   config.rope_type, dtype=dtype)
         act = _default_activation(config.activation_function)
-        self.layers = [
+        self.layers = nnx.List([
             TransformerLayer(act, config.vocoder_dim, config.vocoder_attention_heads, config.vocoder_intermediate_dim,
                              False, config.ln_type, tuple(config.vocoder_attn_window_size), dtype=dtype, rngs=rngs)
             for _ in range(config.vocoder_num_layers)
-        ]
+        ])
         self.layer_norm = build_norm(config.ln_type, config.vocoder_dim, dtype, rngs)
         self.head = ISTFTHead(config.vocoder_dim, config.nfft, config.hop_length, config.vocoder_padding, dtype=dtype,
                               rngs=rngs)
@@ -581,12 +582,12 @@ class AudioDecoder(nnx.Module):
                                                   config.max_audio_seconds * config.sampling_rate // config.hop_length,
                                                   config.rope_type, dtype=dtype)
         act = _default_activation(config.activation_function)
-        self.layers = [
+        self.layers = nnx.List([
             TransformerLayer(act, config.d_model, config.decoder_attention_heads, config.decoder_ffn_dim,
                              config.decoder_causal, config.ln_type, tuple(config.decoder_attn_window_size), dtype=dtype,
                              rngs=rngs)
             for _ in range(config.decoder_layers)
-        ]
+        ])
         self.layer_norm = build_norm(config.ln_type, config.d_model, dtype, rngs)
         self.dconv2 = CausalConvTranspose1d(config.d_model, config.n_mels, config.decoder_kernel_size,
                                             config.decoder_stride_size, dtype=dtype, rngs=rngs)

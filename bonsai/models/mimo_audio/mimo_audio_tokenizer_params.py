@@ -165,7 +165,8 @@ def _assign_weights(
         if tensor.shape != state_dict[key].shape:
             raise ValueError(f"Shape mismatch: {tensor.shape} vs {state_dict[key].shape}")
 
-        state_dict[key] = jax.device_put(tensor)
+        target_dtype = state_dict[key].dtype
+        state_dict[key] = jax.device_put(jnp.asarray(tensor, dtype=target_dtype))
     else:
         _assign_weights(rest, tensor, state_dict[key], transform)
 
@@ -183,10 +184,8 @@ def load_tokenizer_weights_from_safetensors(
     dtype=jnp.float32,
     rngs: nnx.Rngs | None = None,
 ) -> model_lib.FlaxMiMoAudioTokenizer:
-    if rngs is None:
-        rngs = nnx.Rngs(params=0)
 
-    model = nnx.eval_shape(lambda: model_lib.FlaxMiMoAudioTokenizer(config, dtype=dtype, rngs=rngs))
+    model = nnx.eval_shape(lambda: model_lib.FlaxMiMoAudioTokenizer(config, dtype=dtype, rngs=nnx.Rngs(params=0)))
     graph_def, abs_state = nnx.split(model)
     state_dict = abs_state.to_pure_dict()
 
@@ -217,6 +216,25 @@ def load_tokenizer_weights_from_safetensors(
         )
 
     model = nnx.merge(graph_def, state_dict)
+
+    encoder_rotary_dim = config.d_model // config.encoder_attention_heads
+    encoder_half_dim = encoder_rotary_dim // 2
+    encoder_inv_freq = 1.0 / (config.rope_theta ** (jnp.arange(0, encoder_half_dim, dtype=jnp.float32) / float(encoder_half_dim)))
+    model.encoder.position_embedding.inv_freq.value = encoder_inv_freq
+
+    decoder_rotary_dim = config.d_model // config.decoder_attention_heads
+    decoder_half_dim = decoder_rotary_dim // 2
+    decoder_inv_freq = 1.0 / (config.rope_theta ** (jnp.arange(0, decoder_half_dim, dtype=jnp.float32) / float(decoder_half_dim)))
+    model.decoder.position_embedding.inv_freq.value = decoder_inv_freq
+
+    vocoder_rotary_dim = config.vocoder_dim // config.vocoder_attention_heads
+    vocoder_half_dim = vocoder_rotary_dim // 2
+    vocoder_inv_freq = 1.0 / (config.rope_theta ** (jnp.arange(0, vocoder_half_dim, dtype=jnp.float32) / float(vocoder_half_dim)))
+    model.decoder.vocoder.position_embedding.inv_freq.value = vocoder_inv_freq
+
+    window = jnp.hanning(config.nfft).astype(dtype)
+    model.decoder.vocoder.head.istft.window.value = window
+
     gc.collect()
 
     print("Tokenizer weights loaded successfully!")
