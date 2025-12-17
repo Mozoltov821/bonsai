@@ -268,8 +268,20 @@ class Qwen2(nnx.Module):
     def init_cache(
         self, cfg: ModelConfig, batch_size: int, token_len: int, generate_steps: int, dtype: jnp.dtype = jnp.bfloat16
     ) -> Cache:
-        cache_size = 2 ** math.ceil(math.log2(max(token_len + generate_steps, 1)))  # Pad for a sharding-friendly size.
+        cache_size = 2 ** math.ceil(math.log2(max(token_len + generate_steps, 1)))
         return [LayerCache(cfg, batch_size, cache_size, dtype) for _ in range(cfg.num_layers)]
+
+    @nnx.jit
+    def forward(self, cache: Cache, tokens: Array, pad_id: int, vocab_limit: int = 151643) -> tuple[Array, Cache]:
+        segment_ids = 1 * (tokens != pad_id)
+        num_right_pads = count_right_pads(tokens, pad_id)
+        logits = self(tokens, segment_ids, cache, num_right_pads)
+        target_ind = tokens.shape[-1] - num_right_pads - 1
+
+        mask = jnp.arange(logits.shape[-1]) >= vocab_limit
+        logits = jnp.where(mask[None, :], -jnp.inf, logits)
+
+        return logits[:, target_ind], cache
 
     def __call__(self, tokens, segment_ids, cache, num_right_pads):
         x = self.embedder.embedding.value.at[(tokens,)].get(out_sharding=self.out_emb_shd)
@@ -279,14 +291,6 @@ class Qwen2(nnx.Module):
         return logits
 
 
-def forward(model: nnx.Module, cache: Cache, tokens: Array, pad_id: int, vocab_limit: int = 151643) -> tuple[Array, nnx.Cache]:
-    segment_ids = 1 * (tokens != pad_id)
-    num_right_pads = count_right_pads(tokens, pad_id)
-    logits = model(tokens, segment_ids, cache, num_right_pads)
-    target_ind = tokens.shape[-1] - num_right_pads - 1
-
-    # Mask logits beyond tokenizer vocab size to prevent invalid tokens
-    mask = jnp.arange(logits.shape[-1]) >= vocab_limit
-    logits = jnp.where(mask[None, :], -jnp.inf, logits)
-
-    return logits[:, target_ind], cache
+def forward(model: Qwen2, cache: Cache, tokens: Array, pad_id: int, vocab_limit: int = 151643) -> tuple[Array, Cache]:
+    """Backward compatibility wrapper. Use model.forward() instead."""
+    return model.forward(cache, tokens, pad_id, vocab_limit)
