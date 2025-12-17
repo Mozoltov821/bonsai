@@ -1,10 +1,7 @@
-"""MiMo Audio Weight Loading - Optimized Version"""
-
 import gc
 import re
 from typing import Any
 
-import jax
 import jax.numpy as jnp
 from flax import nnx
 
@@ -64,65 +61,78 @@ def _get_jax_key(
     return None, None
 
 
-def load_mimo_audio_weights(model, state_dict: dict):
-    """Load all weights for MiMo Audio model using declarative approach."""
-    print("Loading MiMo Audio weights from safetensors...")
+def create_model_with_weights(
+    model_path: str,
+    config,
+    args,
+    rngs: nnx.Rngs | None = None,
+) -> Any:
+    """Create MiMo Audio model and load weights from safetensors."""
+    import os
+    import json
+    from safetensors import safe_open
 
-    # Split model into graph and state
+    if rngs is None:
+        rngs = nnx.Rngs(0)
+
+    print("Creating MiMo Audio model with weights...")
+
+    # Import here to avoid circular dependency
+    from bonsai.models.mimo_audio.modeling import FlaxMiMoAudioForCausalLM
+
+    # Create model with eval_shape (memory efficient)
+    model = nnx.eval_shape(lambda: FlaxMiMoAudioForCausalLM(config, args, rngs))
     graph_def, abs_state = nnx.split(model)
     pure_state_dict = abs_state.to_pure_dict()
 
-    # Build comprehensive key mapping
-    full_mapping = {}
+    # Load safetensors
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    state_dict = {}
 
-    # Qwen2 main model
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            index = json.load(f)
+        for shard_file in sorted(set(index["weight_map"].values())):
+            with safe_open(os.path.join(model_path, shard_file), framework="numpy") as f:
+                for key in f.keys():
+                    state_dict[key] = f.get_tensor(key)
+    else:
+        safetensors_path = os.path.join(model_path, "model.safetensors")
+        with safe_open(safetensors_path, framework="numpy") as f:
+            for key in f.keys():
+                state_dict[key] = f.get_tensor(key)
+
+    # Build key mapping
+    full_mapping = {}
     full_mapping.update(_get_qwen2_key_mapping("model"))
-    # Local transformer
     full_mapping.update(_get_qwen2_key_mapping("local_transformer"))
-    # Input local transformer
     full_mapping.update(_get_qwen2_key_mapping("input_local_transformer"))
-    # MiMo-specific layers
-    full_mapping.update(_get_mimo_key_mapping(model.audio_channels))
+    full_mapping.update(_get_mimo_key_mapping(config.audio_channels))
 
     conversion_errors = []
     loaded_count = 0
-    skipped_keys = []
 
     for torch_key, tensor in state_dict.items():
         jax_key, transform = _get_jax_key(full_mapping, torch_key)
         if jax_key is None:
-            skipped_keys.append(torch_key)
             continue
 
         keys = [_stoi(k) for k in jax_key.split(".")]
         try:
-            # Convert to bfloat16
             tensor_jax = jnp.asarray(tensor, dtype=jnp.bfloat16)
-
-            # Assign to state dict (no sharding for now)
             _assign_weights(keys, tensor_jax, pure_state_dict, torch_key, transform, None)
             loaded_count += 1
         except Exception as e:
             full_jax_key = ".".join([str(k) for k in keys])
-            conversion_errors.append(f"Failed to assign '{torch_key}' to '{full_jax_key}': {type(e).__name__}: {e}")
+            conversion_errors.append(f"Failed: '{torch_key}' -> '{full_jax_key}': {e}")
 
     if conversion_errors:
-        print(f"Warning: {len(conversion_errors)} conversion errors occurred")
-        for err in conversion_errors[:5]:  # Show first 5 errors
-            print(f"  - {err}")
-        if len(conversion_errors) > 5:
-            print(f"  ... and {len(conversion_errors) - 5} more")
+        raise RuntimeError(
+            f"Encountered {len(conversion_errors)} weight conversion errors:\n" + "\n".join(conversion_errors[:10])
+        )
 
-    if skipped_keys:
-        print(f"Info: Skipped {len(skipped_keys)} keys not in mapping")
-
-    # Merge back
-    model_updated = nnx.merge(graph_def, pure_state_dict)
-
-    # Copy updated state back to original model
-    nnx.update(model, nnx.state(model_updated))
-
+    model = nnx.merge(graph_def, pure_state_dict)
     gc.collect()
 
-    print(f"MiMo Audio weights loaded successfully! ({loaded_count} parameters)")
+    print(f"MiMo Audio model created successfully! ({loaded_count} parameters loaded)")
     return model
