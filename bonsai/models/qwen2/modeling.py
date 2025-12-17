@@ -150,16 +150,10 @@ class Attention(nnx.Module):
         self.shd_cfg = cfg.shd_cfg
 
         # Use standard Linear layers (bias will be added manually)
-        self.q_proj = nnx.Linear(cfg.emb_dim, cfg.emb_dim, use_bias=False, rngs=rngs)
-        self.k_proj = nnx.Linear(cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim, use_bias=False, rngs=rngs)
-        self.v_proj = nnx.Linear(cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim, use_bias=False, rngs=rngs)
+        self.q_proj = nnx.Linear(cfg.emb_dim, cfg.emb_dim, use_bias=True, rngs=rngs)
+        self.k_proj = nnx.Linear(cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim, use_bias=True, rngs=rngs)
+        self.v_proj = nnx.Linear(cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim, use_bias=True, rngs=rngs)
         self.o_proj = nnx.Linear(cfg.num_heads * cfg.head_dim, cfg.emb_dim, use_bias=False, rngs=rngs)
-
-        # Bias will be loaded manually after model creation
-        self.q_bias = None
-        self.k_bias = None
-        self.v_bias = None
-        self.o_bias = None
 
         self.cfg = cfg
         self.n_rep = cfg.num_heads // cfg.num_kv_heads
@@ -169,22 +163,9 @@ class Attention(nnx.Module):
     @jax.named_scope("attention")
     def __call__(self, x: Array, cache: LayerCache | None, segment_ids: Array) -> Array:
         # Linear projections
-        q_linear = self.q_proj(x)  # [B, T, emb_dim]
-        k_linear = self.k_proj(x)  # [B, T, num_kv_heads * head_dim]
-        v_linear = self.v_proj(x)  # [B, T, num_kv_heads * head_dim]
-
-        # Add bias manually if available
-        if self.q_bias is not None:
-            q_bias_val = self.q_bias.value if hasattr(self.q_bias, 'value') else self.q_bias
-            q_linear = q_linear + q_bias_val
-        if self.k_bias is not None:
-            k_bias_val = self.k_bias.value if hasattr(self.k_bias, 'value') else self.k_bias
-            k_linear = k_linear + k_bias_val
-        if self.v_bias is not None:
-            v_bias_val = self.v_bias.value if hasattr(self.v_bias, 'value') else self.v_bias
-            v_linear = v_linear + v_bias_val
-
-        # Reshape to attention heads
+        q_linear = self.q_proj(x)
+        k_linear = self.k_proj(x)
+        v_linear = self.v_proj(x)
         b, t, _ = q_linear.shape
         query_proj = q_linear.reshape(b, t, self.cfg.num_heads, self.cfg.head_dim)  # [B, T, N, H]
         key_proj = k_linear.reshape(b, t, self.cfg.num_kv_heads, self.cfg.head_dim)  # [B, T, K, H]
@@ -239,11 +220,7 @@ class Attention(nnx.Module):
         # Reshape for o_proj: (B, T, N, H) -> (B, T, N*H)
         qkv = qkv.reshape((b, t, n * h))
 
-        # Apply o_proj
         output = self.o_proj(qkv)
-        if self.o_bias is not None:
-            o_bias_val = self.o_bias.value if hasattr(self.o_bias, 'value') else self.o_bias
-            output = output + o_bias_val
 
         cache.cur_ind.value = cache.cur_ind.value + t
         return shard(output, self.shd_cfg.act_btd)
