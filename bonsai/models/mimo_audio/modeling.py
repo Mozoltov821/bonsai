@@ -1,10 +1,8 @@
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
-
 import jax
 import jax.numpy as jnp
 from flax import nnx
-
 from bonsai.models.qwen2.modeling import Qwen2, ModelConfig as Qwen2Config, Cache
 
 
@@ -255,7 +253,7 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         """Create local transformer Qwen2 config"""
         return Qwen2Config(
             num_layers=config.local_layers,
-            vocab_size=config.vocab_size,  # Not used
+            vocab_size=config.vocab_size,
             emb_dim=config.local_dim,
             mlp_dim=config.local_ffn_dim,
             num_heads=config.local_attn_heads,
@@ -270,7 +268,7 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         """Create input local transformer Qwen2 config"""
         return Qwen2Config(
             num_layers=config.input_local_layers,
-            vocab_size=config.vocab_size,  # Not used
+            vocab_size=config.vocab_size,
             emb_dim=config.input_local_dim,
             mlp_dim=config.input_local_dim * 4,
             num_heads=config.local_attn_heads,

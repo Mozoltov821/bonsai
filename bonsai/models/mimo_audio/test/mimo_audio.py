@@ -9,17 +9,120 @@ from typing import Union, Optional, List
 import soundfile as sf
 from process_speechdata import InputSegment, StreamingInputSegment
 from bonsai.models.mimo_audio.melSpectrogram import MelSpectrogram
-from bonsai.models.mimo_audio.mimo_audio_tokenizer import FlaxMiMoAudioTokenizer
-# from configuration_audio_tokenizer import MiMoAudioTokenizerConfig
 from bonsai.models.mimo_audio.mimo_audio_tokenizer_params import load_tokenizer_weights_from_safetensors
-# from .templates import asr_en_templates, asr_zh_templates, tts_en_templates, tts_zh_templates
+from bonsai.models.mimo_audio.params import create_model_with_weights
+
+from templates import asr_en_templates, asr_zh_templates, tts_en_templates, tts_zh_templates
 from bonsai.models.mimo_audio.modeling import (
     MiMoAudioArguments,
     MiMoAudioConfig,
-    FlaxMiMoAudioForCausalLM,
     MiMoSampler,
     MiMoSamplerConfig,
 )
+from transformers import PretrainedConfig
+
+
+class MiMoAudioTokenizerConfig(PretrainedConfig):
+    model_type = "mimo_audio_tokenizer"
+
+    def __init__(
+            self,
+            max_audio_seconds: int = 1800,
+            stride_size: int = 2,
+            avg_pooler: int = 1,
+            d_model: int = 768,
+            scale_embedding: bool = True,
+            kernel_size: int = 3,
+            activation_function: str = "gelu",
+            encoder_layers: int = 8,
+            encoder_skip_layer_id: int = None,
+            encoder_attention_heads: int = 12,
+            encoder_ffn_dim: int = 3072,
+            encoder_causal: bool = False,
+            encoder_attn_window_size: list[int] = None,
+            decoder_layers: int = 8,
+            decoder_attention_heads: int = 12,
+            decoder_ffn_dim: int = 3072,
+            decoder_kernel_size: int = 3,
+            decoder_stride_size: int = 2,
+            decoder_causal: bool = True,
+            decoder_attn_window_size: list[int] = None,
+            nfft: int = 1024,
+            vocoder_dim: int = 512,
+            vocoder_intermediate_dim: int = 4096,
+            vocoder_num_layers: int = 30,
+            n_mels: int = 80,
+            sampling_rate: int = 24000,
+            hop_length: int = 240,
+            window_size: int = 1024,
+            vocoder_padding: str = "same",
+            fmin: int = 0,
+            fmax: int = None,
+            num_quantizers: int = 12,
+            codebook_size: list[int] = None,
+            threshold_ema_dead_code: int = 10,
+            position_embedding_type: str = "rope",
+            rope_theta: int = 10000,
+            rope_type: str = "default",
+            ln_type: str = "LayerNorm",
+            vocoder_attention_heads: int = 4,
+            vocoder_attn_window_size: list[int] = None,
+            **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.max_audio_seconds = max_audio_seconds
+        self.stride_size = stride_size
+        self.avg_pooler = avg_pooler
+        self.d_model = d_model
+        self.scale_embedding = scale_embedding
+        self.kernel_size = kernel_size
+        self.activation_function = activation_function
+        self.encoder_layers = encoder_layers
+        self.encoder_skip_layer_id = encoder_skip_layer_id
+        self.encoder_attention_heads = encoder_attention_heads
+        self.encoder_ffn_dim = encoder_ffn_dim
+        self.encoder_causal = encoder_causal
+        self.encoder_attn_window_size = (
+            encoder_attn_window_size
+            if encoder_attn_window_size is not None
+            else [-1, -1]
+        )
+        self.decoder_layers = decoder_layers
+        self.decoder_attention_heads = decoder_attention_heads
+        self.decoder_ffn_dim = decoder_ffn_dim
+        self.decoder_kernel_size = decoder_kernel_size
+        self.decoder_stride_size = decoder_stride_size
+        self.decoder_causal = decoder_causal
+        self.decoder_attn_window_size = (
+            decoder_attn_window_size
+            if decoder_attn_window_size is not None
+            else [-1, -1]
+        )
+        self.nfft = nfft
+        self.vocoder_dim = vocoder_dim
+        self.vocoder_intermediate_dim = vocoder_intermediate_dim
+        self.vocoder_num_layers = vocoder_num_layers
+        self.n_mels = n_mels
+        self.sampling_rate = sampling_rate
+        self.hop_length = hop_length
+        self.window_size = window_size
+        self.vocoder_padding = vocoder_padding
+        self.fmin = fmin
+        self.fmax = fmax
+        self.num_quantizers = num_quantizers
+        self.codebook_size = codebook_size if codebook_size is not None else [1024]
+        self.threshold_ema_dead_code = threshold_ema_dead_code
+        self.position_embedding_type = position_embedding_type
+        self.rope_theta = rope_theta
+        self.rope_type = rope_type
+        self.ln_type = ln_type
+        self.vocoder_attention_heads = vocoder_attention_heads
+        self.vocoder_attn_window_size = (
+            vocoder_attn_window_size
+            if vocoder_attn_window_size is not None
+            else [40, 10]
+        )
+
 
 
 def detect_language(text):
@@ -110,33 +213,12 @@ class MimoAudioJAX:
             eot_idx=self.eot_idx,
         )
 
-        # Create model
-        rngs = nnx.Rngs(0)
-        self.model = FlaxMiMoAudioForCausalLM(config, args, rngs)
-
-        # Load weights
-        from src.mimo_audio.params import load_mimo_audio_weights
-        from safetensors import safe_open
-
-        # Load model weights from safetensors
-        index_path = os.path.join(self.path, "model.safetensors.index.json")
-        if os.path.exists(index_path):
-            with open(index_path) as f:
-                index = json.load(f)
-            state_dict = {}
-            for shard_file in sorted(set(index["weight_map"].values())):
-                with safe_open(os.path.join(self.path, shard_file), framework="numpy") as f:
-                    for key in f.keys():
-                        state_dict[key] = f.get_tensor(key)
-        else:
-            # Single file
-            safetensors_path = os.path.join(self.path, "model.safetensors")
-            state_dict = {}
-            with safe_open(safetensors_path, framework="numpy") as f:
-                for key in f.keys():
-                    state_dict[key] = f.get_tensor(key)
-
-        load_mimo_audio_weights(self.model, state_dict)
+        self.model = create_model_with_weights(
+            model_path=self.path,
+            config=config,
+            args=args,
+            rngs=nnx.Rngs(0)
+        )
 
         self.group_size = config.group_size
         self.audio_channels = config.audio_channels
@@ -154,21 +236,19 @@ class MimoAudioJAX:
             tokenizer_config_dict = json.load(f)
         tokenizer_config = MiMoAudioTokenizerConfig(**tokenizer_config_dict)
 
-        self.mimo_audio_tokenizer = FlaxMiMoAudioTokenizer(
+        tokenizer_weights_path = os.path.join(self.mimo_audio_tokenizer_path, "model.safetensors")
+        self.mimo_audio_tokenizer = load_tokenizer_weights_from_safetensors(
             tokenizer_config,
+            tokenizer_weights_path,
             dtype=jnp.bfloat16,
             rngs=nnx.Rngs(0)
         )
-
-        # Load tokenizer weights
-        tokenizer_weights_path = os.path.join(self.mimo_audio_tokenizer_path, "model.safetensors")
-        load_tokenizer_weights_from_safetensors(self.mimo_audio_tokenizer, tokenizer_weights_path)
 
         self.tokenizer_config = tokenizer_config
         print(f"MiMo-Audio Tokenizer loaded in {time.monotonic() - start_loading_mimo_audio_tokenizer_time:.2f} seconds")
 
         # Initialize mel spectrogram transform
-        self.mel_transform = JaxMelSpectrogram(
+        self.mel_transform = MelSpectrogram(
             sample_rate=tokenizer_config.sampling_rate,
             n_fft=tokenizer_config.nfft,
             hop_length=tokenizer_config.hop_length,
