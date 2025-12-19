@@ -11,21 +11,21 @@ from bonsai.models.qwen2.params import Transform, TRANSFORM_LINEAR, TRANSFORM_NO
 def _get_qwen2_key_mapping(prefix: str) -> dict[str, tuple[str, Transform]]:
     """Generate key mapping for Qwen2 submodules with prefix."""
     return {
-        rf"{prefix}\.embed_tokens\.weight": ("embedder.embedding", TRANSFORM_NONE),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.q_proj\.weight": (r"layers.\1.attn.q_proj.kernel", TRANSFORM_LINEAR),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.k_proj\.weight": (r"layers.\1.attn.k_proj.kernel", TRANSFORM_LINEAR),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.v_proj\.weight": (r"layers.\1.attn.v_proj.kernel", TRANSFORM_LINEAR),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.o_proj\.weight": (r"layers.\1.attn.o_proj.kernel", TRANSFORM_LINEAR),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.q_proj\.bias": (r"layers.\1.attn.q_proj.bias", TRANSFORM_NONE),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.k_proj\.bias": (r"layers.\1.attn.k_proj.bias", TRANSFORM_NONE),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.v_proj\.bias": (r"layers.\1.attn.v_proj.bias", TRANSFORM_NONE),
-        rf"{prefix}\.layers\.([0-9]+)\.mlp\.gate_proj\.weight": (r"layers.\1.mlp.gate_proj.kernel", TRANSFORM_LINEAR),
-        rf"{prefix}\.layers\.([0-9]+)\.mlp\.up_proj\.weight": (r"layers.\1.mlp.up_proj.kernel", TRANSFORM_LINEAR),
-        rf"{prefix}\.layers\.([0-9]+)\.mlp\.down_proj\.weight": (r"layers.\1.mlp.down_proj.kernel", TRANSFORM_LINEAR),
-        rf"{prefix}\.norm\.weight": ("final_norm.scale", TRANSFORM_NONE),
-        rf"{prefix}\.layers\.([0-9]+)\.input_layernorm\.weight": (r"layers.\1.input_layernorm.scale", TRANSFORM_NONE),
+        rf"{prefix}\.embed_tokens\.weight": (f"{prefix}.embedder.embedding", TRANSFORM_NONE),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.q_proj\.weight": (rf"{prefix}.layers.\1.attn.q_proj.kernel", TRANSFORM_LINEAR),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.k_proj\.weight": (rf"{prefix}.layers.\1.attn.k_proj.kernel", TRANSFORM_LINEAR),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.v_proj\.weight": (rf"{prefix}.layers.\1.attn.v_proj.kernel", TRANSFORM_LINEAR),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.o_proj\.weight": (rf"{prefix}.layers.\1.attn.o_proj.kernel", TRANSFORM_LINEAR),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.q_proj\.bias": (rf"{prefix}.layers.\1.attn.q_proj.bias", TRANSFORM_NONE),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.k_proj\.bias": (rf"{prefix}.layers.\1.attn.k_proj.bias", TRANSFORM_NONE),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.v_proj\.bias": (rf"{prefix}.layers.\1.attn.v_proj.bias", TRANSFORM_NONE),
+        rf"{prefix}\.layers\.([0-9]+)\.mlp\.gate_proj\.weight": (rf"{prefix}.layers.\1.mlp.gate_proj.kernel", TRANSFORM_LINEAR),
+        rf"{prefix}\.layers\.([0-9]+)\.mlp\.up_proj\.weight": (rf"{prefix}.layers.\1.mlp.up_proj.kernel", TRANSFORM_LINEAR),
+        rf"{prefix}\.layers\.([0-9]+)\.mlp\.down_proj\.weight": (rf"{prefix}.layers.\1.mlp.down_proj.kernel", TRANSFORM_LINEAR),
+        rf"{prefix}\.norm\.weight": (f"{prefix}.final_norm.scale", TRANSFORM_NONE),
+        rf"{prefix}\.layers\.([0-9]+)\.input_layernorm\.weight": (rf"{prefix}.layers.\1.input_layernorm.scale", TRANSFORM_NONE),
         rf"{prefix}\.layers\.([0-9]+)\.post_attention_layernorm\.weight": (
-            r"layers.\1.post_attention_layernorm.scale",
+            rf"{prefix}.layers.\1.post_attention_layernorm.scale",
             TRANSFORM_NONE,
         ),
     }
@@ -52,12 +52,11 @@ def _get_jax_key(
 ) -> tuple[str | None, Transform | None]:
     """Get JAX key from source key using regex mapping."""
     for pat, (jax_key, transform) in mapping.items():
-        if re.fullmatch(pat, source_key):
-            return jax_key, transform
-        # Also try re.match for partial matches with groups
-        match = re.match(pat, source_key)
+        match = re.fullmatch(pat, source_key)
         if match:
-            return re.sub(pat, jax_key, source_key), transform
+            # Use re.sub to handle backreferences like \1
+            result_key = re.sub(pat, jax_key, source_key)
+            return result_key, transform
     return None, None
 
 
@@ -81,7 +80,7 @@ def create_model_with_weights(
     from bonsai.models.mimo_audio.modeling import FlaxMiMoAudioForCausalLM
 
     # Create model with eval_shape (memory efficient)
-    model = nnx.eval_shape(lambda: FlaxMiMoAudioForCausalLM(config, args, rngs))
+    model = nnx.eval_shape(lambda: FlaxMiMoAudioForCausalLM(config, args, nnx.Rngs(0)))
     graph_def, abs_state = nnx.split(model)
     pure_state_dict = abs_state.to_pure_dict()
 
@@ -122,6 +121,9 @@ def create_model_with_weights(
             tensor_jax = jnp.asarray(tensor, dtype=jnp.bfloat16)
             _assign_weights(keys, tensor_jax, pure_state_dict, torch_key, transform, None)
             loaded_count += 1
+        except KeyError as e:
+            # Skip weights for modules that are set to None (e.g., embedder)
+            continue
         except Exception as e:
             full_jax_key = ".".join([str(k) for k in keys])
             conversion_errors.append(f"Failed: '{torch_key}' -> '{full_jax_key}': {e}")
