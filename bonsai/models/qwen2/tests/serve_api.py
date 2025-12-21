@@ -41,7 +41,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = 1.0
     top_p: float = 0.8
     top_k: int = 10
-    max_tokens: int = 512
+    max_tokens: int = 2048
     stream: bool = False
 
 
@@ -51,7 +51,7 @@ class CompletionRequest(BaseModel):
     temperature: float = 1.0
     top_p: float = 0.8
     top_k: int = 10
-    max_tokens: int = 512
+    max_tokens: int = 2048
 
 
 class ChatCompletionResponse(BaseModel):
@@ -100,6 +100,22 @@ class Qwen2Server:
         self.pad_id = self.tokenizer.pad_token_id
         self.eos_id = self.tokenizer.eos_token_id
 
+        # JIT compile forward for better performance
+        print("Compiling forward function with JIT...")
+
+        @jax.jit
+        def forward_jit(model, cache, tokens, pad_id):
+            return modeling.forward(model, cache, tokens, pad_id)
+
+        self.forward_jit = forward_jit
+
+        # Warmup: compile with dummy input
+        print("Warming up model...")
+        dummy_tokens = jnp.array([[1, 2, 3, 4, 5]])
+        dummy_cache = self.model.init_cache(self.config, 1, 5, 10)
+        _ = self.forward_jit(self.model, dummy_cache, dummy_tokens, self.pad_id)
+        print("Model ready!")
+
     def tokenize(self, texts: list[str]) -> jnp.ndarray:
         """Tokenize input texts with left padding."""
         lines = [self.tokenizer.encode(text) for text in texts]
@@ -119,7 +135,7 @@ class Qwen2Server:
     def generate(
         self,
         tokens: jnp.ndarray,
-        max_tokens: int = 512,
+        max_tokens: int = 2048,
         temperature: float = 1.0,
         top_p: float = 0.8,
         top_k: int = 10,
@@ -141,7 +157,7 @@ class Qwen2Server:
         key = jax.random.key(int(time.time() * 1000) % 2**32)
 
         # Prefill
-        logits, cache = modeling.forward(self.model, cache, tokens, self.pad_id)
+        logits, cache = self.model.forward(cache, tokens, self.pad_id)
         next_tokens = sampler_fn(logits, key=key)
 
         # Decode
@@ -149,7 +165,7 @@ class Qwen2Server:
         finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
 
         for _ in range(max_tokens):
-            logits, cache = modeling.forward(self.model, cache, next_tokens, self.pad_id)
+            logits, cache = self.model.forward(cache, next_tokens, self.pad_id)
             next_tokens = sampler_fn(logits, key=key)
             finished = finished | (next_tokens.squeeze(-1) == self.eos_id)
             tokens_list.append(next_tokens)

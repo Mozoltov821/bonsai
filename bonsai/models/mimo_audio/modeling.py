@@ -182,7 +182,7 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         self.lm_head = None
 
         # Local transformer LM heads for each audio channel
-        self.local_transformer_lm_heads = [
+        self.local_transformer_lm_heads = nnx.List([
             nnx.Linear(
                 config.local_dim,
                 self.speech_vocab_sizes[i],
@@ -191,10 +191,10 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
                 rngs=rngs
             )
             for i in range(self.audio_channels)
-        ]
+        ])
 
         # Speech embeddings for each audio channel
-        self.speech_embeddings = [
+        self.speech_embeddings = nnx.List([
             nnx.Embed(
                 self.speech_vocab_sizes[i],
                 config.input_local_dim,
@@ -202,7 +202,7 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
                 rngs=rngs
             )
             for i in range(self.audio_channels)
-        ]
+        ])
 
         # Projection from input_local_dim to local_dim if different
         if config.input_local_dim != config.local_dim:

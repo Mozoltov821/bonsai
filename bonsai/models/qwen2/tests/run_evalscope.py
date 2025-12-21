@@ -86,7 +86,7 @@ def main():
                         help="Base URL of the API server")
     parser.add_argument("--datasets", type=str, default="gsm8k",
                         help="Comma-separated list of datasets (e.g., ceval,mmlu)")
-    parser.add_argument("--limit", type=int, default=10,
+    parser.add_argument("--limit", type=int, default=1,
                         help="Number of samples to evaluate per dataset")
     parser.add_argument("--output-dir", type=str, default="./eval_results",
                         help="Directory to save evaluation results")

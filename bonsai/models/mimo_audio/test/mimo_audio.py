@@ -254,7 +254,7 @@ class MimoAudioJAX:
             hop_length=tokenizer_config.hop_length,
             win_length=tokenizer_config.window_size,
             f_min=tokenizer_config.fmin,
-            f_max=tokenizer_config.fmax,
+            f_max=tokenizer_config.fmax if tokenizer_config.fmax is not None else tokenizer_config.sampling_rate / 2.0,
             n_mels=tokenizer_config.n_mels,
             power=1.0,
             center=True,
