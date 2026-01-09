@@ -98,7 +98,7 @@ class ModelConfig:
         return cls._from_param(
             use_sharding,
             num_layers=28,
-            vocab_size=151936,
+            vocab_size=152064,
             emb_dim=3584,
             mlp_dim=18944,
             num_heads=28,
