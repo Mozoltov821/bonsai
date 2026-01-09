@@ -137,8 +137,8 @@ class MiMoSampler:
                 logits = logits.at[:, t].set(-jnp.inf)
 
         if self.config.do_sample:
-            probs = jax.nn.softmax(logits, axis=-1)
-            return jax.random.categorical(key, jnp.log(probs + 1e-10), axis=-1)
+            # jax.random.categorical expects logits (unnormalized log probs), not probs
+            return jax.random.categorical(key, logits, axis=-1)
         else:
             return jnp.argmax(logits, axis=-1)
 
@@ -376,6 +376,9 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         # Apply input_local_transformer (pass None for cache during prefill)
         speech_embeds = self.apply_input_local_transformer(speech_embeds, cache=None)
 
+        # ✅ 关键修复：apply_input_local_transformer 后再次 mask（与官方实现一致）
+        speech_embeds = speech_embeds * is_speech[:, :, None, None]
+
         T_groups = speech_embeds.shape[1]
         # Flatten group dimension and project
         speech_grouped_embeds = self.speech_group_downcast(
@@ -383,8 +386,13 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         )  # [B, T_groups, hidden_size]
 
         # Get text embeddings
-        text_embeds = text_embed_fn(text_input_ids)  # [B, T_groups, hidden_size]
-        text_zero_mask = text_input_ids == self.args.empty_idx
+        # ✅ 关键修复：处理 -100 padding tokens
+        # 将 -100 替换为 0（或任何有效索引），因为我们会mask掉这些位置
+        text_input_ids_safe = jnp.where(text_input_ids == -100, 0, text_input_ids)
+        text_embeds = text_embed_fn(text_input_ids_safe)  # [B, T_groups, hidden_size]
+
+        # Mask掉 empty_idx 和 -100 的位置
+        text_zero_mask = (text_input_ids == self.args.empty_idx) | (text_input_ids == -100)
         text_embeds = text_embeds * ~text_zero_mask[..., None]
 
         return text_embeds + speech_grouped_embeds
@@ -417,9 +425,12 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         # Prepare combined text+speech embeddings
         inputs_embeds = self._prepare_input_embeds(input_ids, text_embed_fn)
 
-        # Create segment IDs (all 1s for valid tokens)
+        # Create segment IDs
+        # ✅ 关键修复：只mask -100 padding，empty_idx是有意义的token不应该被mask
+        # 官方使用全1的attention_mask，不mask empty_idx位置
+        # -100在::group_size采样后不应出现在text_input_ids中，但为了安全仍然检查
         B, T_groups, _ = inputs_embeds.shape
-        segment_ids = jnp.ones((B, T_groups), dtype=jnp.int32)
+        segment_ids = 1 * (text_input_ids != -100)  # [B, T_groups] - 只mask -100，不mask empty_idx
 
         # Run through main transformer (ensure bfloat16)
         x = inputs_embeds.astype(jnp.bfloat16)
@@ -441,7 +452,6 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
             self,
             local_embeds: jnp.ndarray,  # [B, 1, local_dim]
             key: jax.random.PRNGKey,
-            cache: Cache,
             local_sampler: Optional[MiMoSampler] = None,
     ) -> jnp.ndarray:
         """
@@ -450,7 +460,6 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         Args:
             local_embeds: [B, 1, local_dim]
             key: Random key for sampling
-            cache: KV cache for local transformer
             local_sampler: Sampler configuration
 
         Returns:
@@ -466,6 +475,16 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
 
         if local_sampler is None:
             local_sampler = MiMoSampler(MiMoSamplerConfig())
+
+        # ✅ 关键修复：每次调用都创建新的 cache（与官方实现一致）
+        # 官方实现：past_key_values = DynamicCache() 每次都是新的
+        cache = self.local_transformer.init_cache(
+            self.local_qwen2_config,
+            B,
+            token_len=delay_iters,  # 设置为实际需要的长度
+            generate_steps=0,
+            dtype=jnp.bfloat16,
+        )
 
         # Create segment IDs
         segment_ids = jnp.ones((B, 1), dtype=jnp.int32)
@@ -491,6 +510,15 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
                     cur_lm_head = self.local_transformer_lm_heads[idx]
                     cur_logits = cur_lm_head(hidden_state[:, -1, :])  # [B, vocab_size]
 
+                    # 调试：检查logits范围和分布（仅第一次，第一个通道）
+                    if t == 0 and idx == 0:
+                        import jax
+                        logits_mean = float(jnp.mean(cur_logits))
+                        logits_std = float(jnp.std(cur_logits))
+                        logits_min = float(jnp.min(cur_logits))
+                        logits_max = float(jnp.max(cur_logits))
+                        # 这些值会在JIT编译后可能不会打印，但可以帮助调试
+
                     # Sample token
                     key, subkey = jax.random.split(key)
                     cur_token = local_sampler.sample(
@@ -503,11 +531,12 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
                     local_tokens = local_tokens.at[:, t - cur_start, idx].set(cur_token)
 
                     # Get embedding for next iteration
-                    cur_input_embed = self.speech_embeddings[idx](cur_token)
+                    # Add sequence dimension: [B] -> [B, 1] before embedding
+                    cur_input_embed = self.speech_embeddings[idx](cur_token[:, None])  # [B, 1, embed_dim]
                     if self.speech_embeddings_to_local is not None:
                         cur_input_embed = self.speech_embeddings_to_local(cur_input_embed)
 
-                    next_local_embeds = next_local_embeds + cur_input_embed[:, None, :]
+                    next_local_embeds = next_local_embeds + cur_input_embed
 
             local_embeds = next_local_embeds
 
@@ -550,15 +579,14 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         B = input_ids.shape[0]
         cur_len = input_ids.shape[1] // (self.group_size * (self.audio_channels + 1))
 
-        # Initialize KV caches for all three transformers
+        # Initialize KV cache for main transformer
+        # ✅ 关键修复：不再为 local_transformer 预先创建 cache
+        # local_forward 会在内部创建自己的 cache（每次都是新的）
         token_len = cur_len
         generate_steps = max_length - cur_len
 
         main_cache = self.model.init_cache(
             self.qwen2_config, B, token_len, generate_steps, dtype=jnp.bfloat16
-        )
-        local_cache = self.local_transformer.init_cache(
-            self.local_qwen2_config, B, 1, generate_steps, dtype=jnp.bfloat16
         )
 
         while cur_len < max_length:
@@ -599,7 +627,6 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
                 next_speech_tokens = self.local_forward(
                     local_hidden_states,
                     subkey,
-                    local_cache,
                     local_sampler
                 )
 
