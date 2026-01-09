@@ -1,21 +1,7 @@
-# Copyright 2025 The JAX Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+import os
 import jax
 import jax.numpy as jnp
 import numpy as np
-from huggingface_hub import snapshot_download
 from jax import P
 from transformers import AutoTokenizer
 
@@ -37,8 +23,7 @@ def tokenize(tokenizer, input: list[str], shd: P | None = None):
 
 
 def run_model():
-    # For sharding, you can use one of the following:
-    model_ckpt_path = snapshot_download("Qwen/Qwen2-0.5B")
+    model_ckpt_path = os.path.expanduser("~/.cache/modelscope/hub/models/Qwen/Qwen2-0.5B")
     config = modeling.ModelConfig.qwen2_0_5b(use_sharding=False)
     mesh, batch_shd = None, None
 
@@ -53,33 +38,95 @@ def run_model():
         "天空为什么是蓝色的？",
     ]
 
+    # Load tokenizer from local path
+    # Use the absolute path directly to avoid any model hub lookups
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_ckpt_path,
+        local_files_only=True,
+        trust_remote_code=True,
+    )
 
-    tokenizer = AutoTokenizer.from_pretrained(model_ckpt_path)
+    # Debug: Check tokenizer special tokens
+    print(f"Tokenizer special tokens:")
+    print(f"  eos_token: {tokenizer.eos_token} (ID: {tokenizer.eos_token_id})")
+    print(f"  pad_token: {tokenizer.pad_token} (ID: {tokenizer.pad_token_id})")
+    print(f"  bos_token: {tokenizer.bos_token} (ID: {tokenizer.bos_token_id})")
+    if hasattr(tokenizer, 'im_end_id'):
+        print(f"  im_end_id: {tokenizer.im_end_id}")
+    if hasattr(tokenizer, 'im_start_id'):
+        print(f"  im_start_id: {tokenizer.im_start_id}")
+
+    # Try to find the correct EOS token
+    # For Qwen2, the chat format uses <|im_end|> as the end token
+    im_end_token_id = None
+    if hasattr(tokenizer, 'im_end_id'):
+        im_end_token_id = tokenizer.im_end_id
+    else:
+        # Try to encode the token
+        try:
+            im_end_ids = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+            if im_end_ids:
+                im_end_token_id = im_end_ids[0]
+                print(f"  <|im_end|> token ID: {im_end_token_id}")
+        except:
+            pass
+
+    print()
     tokens = tokenize(tokenizer, query, batch_shd)
     batch_size, token_len = tokens.shape
 
-    generate_steps = 32
+    # Set max generation steps - will stop early if EOS token is generated
+    generate_steps = 1024
     model = params.create_model_from_safe_tensors(model_ckpt_path, config, mesh)
     cache = model.init_cache(config, batch_size, token_len, generate_steps)
 
     key = jax.random.key(0)
-    sampler = Sampler(temperature=1.0, top_p=0.8, top_k=10)
+    # Option 1: Use Sampler with lower temperature
+    sampler = Sampler(temperature=0.7, top_p=0.9, top_k=20)
+
+    # Option 2: Use GreedySampler for deterministic generation
+    # sampler = GreedySampler()
+
     jit_sampler = jax.jit(sampler)
 
-    # prefill
+    print(f"Using sampler: {sampler.__class__.__name__}")
+    print(f"EOS token ID: {tokenizer.eos_token_id}")
+    if im_end_token_id is not None:
+        print(f"IM_END token ID: {im_end_token_id} (NOT used for stopping - only EOS)")
+    print()
+
+    # prefill - only initialize cache, don't start decoding yet
     logits, cache = modeling.forward(model, cache, tokens, tokenizer.pad_token_id)
-    next_tokens = jit_sampler(logits, key=key)
 
     # decode
-    tokens_list = [next_tokens]
+    tokens_list = []
     finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
+
     for i in range(generate_steps):
-        logits, cache = modeling.forward(model, cache, next_tokens, tokenizer.pad_token_id)
-        next_tokens = jit_sampler(logits, key=key)
-        finished = finished | (next_tokens.squeeze(-1) == tokenizer.eos_token_id)
+        # CRITICAL: Split key for each step to avoid deterministic sampling
+        key, subkey = jax.random.split(key)
+        next_tokens = jit_sampler(logits, key=subkey)
+
+        current_token_id = int(next_tokens.squeeze(-1)[0])
+
+        # Only check for actual EOS token (NOT im_end)
+        is_eos = (next_tokens.squeeze(-1) == tokenizer.eos_token_id)
+        finished = finished | is_eos
+
         tokens_list.append(next_tokens)
+
+        # Debug: print every 50 steps
+        if (i + 1) % 50 == 0:
+            eos_flag = " [EOS]" if current_token_id == tokenizer.eos_token_id else ""
+            print(f"Step {i+1}: Token {current_token_id}{eos_flag}")
+
+        # Check if generation is finished
         if finished.all():
+            print(f"✓ Generation stopped at step {i+1}/{generate_steps} (EOS token {current_token_id} reached)")
             break
+
+        # Continue generation
+        logits, cache = modeling.forward(model, cache, next_tokens, tokenizer.pad_token_id)
 
     all_output_tokens = jax.device_get(jnp.concatenate(tokens_list, axis=-1))
     for i, q in enumerate(query):
@@ -89,7 +136,7 @@ def run_model():
         if eos_idx.size > 0:
             seq_tokens = seq_tokens[: eos_idx[0]]
         decoded = tokenizer.decode(seq_tokens, skip_special_tokens=True)
-        print(f"Answer:\n {decoded}\n\n")
+        print(f"Answer ({len(seq_tokens)} tokens):\n {decoded}\n\n")
 
 
 if __name__ == "__main__":
