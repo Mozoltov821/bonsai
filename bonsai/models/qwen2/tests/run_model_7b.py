@@ -28,14 +28,18 @@ def tokenize(tokenizer, input: list[str], shd: P | None = None):
 def run_model():
     # Enable JAX memory optimizations
     import os
-    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.90'
+    # os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+    # os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.90'
 
     model_ckpt_path = os.path.expanduser("~/.cache/modelscope/hub/models/Qwen/Qwen2-7B")
 
     # Disable sharding - run on single GPU
     config = modeling.ModelConfig.qwen2_7b(use_sharding=False)
-    mesh, batch_shd = None, None
+    # mesh, batch_shd = None, None
+
+    mesh = jax.make_mesh((1, 4), ("fsdp", "tp"), axis_types=(AxisType.Explicit, AxisType.Explicit))
+    batch_shd = P("fsdp", None)
+    jax.set_mesh(mesh)
 
     print(f"Running without sharding (single GPU mode)")
     print(f"Available devices: {jax.device_count()}")
@@ -63,7 +67,7 @@ def run_model():
     batch_size, token_len = tokens.shape
 
     # Set max generation steps - reduce to save memory
-    generate_steps = 256
+    generate_steps = 1024
     print(f"\nLoading model...")
     model = params.create_model_from_safe_tensors(model_ckpt_path, config, mesh)
     print(f"Model loaded successfully\n")
@@ -91,6 +95,7 @@ def run_model():
     tokens_list = []
     finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
 
+    im_end_token_id = tokenizer.encode("<|im_end|>")[0]
     for i in range(generate_steps):
         # CRITICAL: Split key for each step to avoid deterministic sampling
         key, subkey = jax.random.split(key)
@@ -100,7 +105,10 @@ def run_model():
 
         # Only check for actual EOS token
         is_eos = (next_tokens.squeeze(-1) == tokenizer.eos_token_id)
-        finished = finished | is_eos
+        is_im_end = (next_tokens.squeeze(-1) == im_end_token_id)
+
+
+        finished = finished | is_eos | is_im_end
 
         tokens_list.append(next_tokens)
 

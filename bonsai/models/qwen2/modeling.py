@@ -34,6 +34,7 @@ from bonsai.models.qwen3.modeling import (
     compute_positions_from_segment_ids,
     count_left_pads,
     count_right_pads,
+    reshard,
     shard,
 )
 
@@ -133,14 +134,22 @@ class Einsum(nnx.Module):
         self.use_bias = use_bias
         self.w = shard(nnx.Param(nnx.initializers.normal()(rngs.params(), shape)), shd)
         if use_bias:
-            # For linear layers, bias shape is the output dimension (last dim of weight)
-            bias_shape = (shape[-1],)
-            self.bias = shard(nnx.Param(nnx.initializers.zeros_init()(rngs.params(), bias_shape)), shd[-1:])
+            # For multi-dimensional weights (D, N, H), bias shape should be (N, H)
+            # For 2D weights (D, V), bias shape should be (V,)
+            # In general, bias shape matches the output dimensions (all dims except first)
+            bias_shape = shape[1:] if len(shape) > 2 else (shape[-1],)
+            # Bias sharding should match the corresponding dimensions in weight sharding
+            # Need to create a new PartitionSpec from the sliced dimensions
+            if len(shape) > 2:
+                bias_shd = P(*shd[1:])  # Create PartitionSpec from remaining dimensions
+            else:
+                bias_shd = P(shd[-1])  # Single dimension PartitionSpec
+            self.bias = shard(nnx.Param(nnx.initializers.zeros_init()(rngs.params(), bias_shape)), bias_shd)
 
     @jax.named_scope("einsum")
     def __call__(self, x: Array) -> Array:
         result = jnp.einsum(self.einsum_str, x, self.w.value)
-        if self.use_bias and hasattr(self.bias, 'value'):
+        if self.use_bias and hasattr(self, 'bias'):
             result = result + self.bias.value
         return result
 
@@ -149,11 +158,39 @@ class Attention(nnx.Module):
     def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs):
         self.shd_cfg = cfg.shd_cfg
 
-        # Use standard Linear layers (bias will be added manually)
-        self.q_proj = nnx.Linear(cfg.emb_dim, cfg.emb_dim, use_bias=True, rngs=rngs)
-        self.k_proj = nnx.Linear(cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim, use_bias=True, rngs=rngs)
-        self.v_proj = nnx.Linear(cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim, use_bias=True, rngs=rngs)
-        self.o_proj = nnx.Linear(cfg.num_heads * cfg.head_dim, cfg.emb_dim, use_bias=False, rngs=rngs)
+        # Use Einsum with sharding for better distributed performance
+        # q_proj: [B, T, D] @ [D, N*H] -> [B, T, N*H] -> reshape to [B, T, N, H]
+        self.q_proj = Einsum(
+            einsum_str="BTD,DNH->BTNH",
+            shape=(cfg.emb_dim, cfg.num_heads, cfg.head_dim),
+            shd=self.shd_cfg.q_weight_ndh,
+            rngs=rngs,
+            use_bias=True,
+        )
+        # k_proj: [B, T, D] @ [D, K*H] -> [B, T, K*H] -> reshape to [B, T, K, H]
+        self.k_proj = Einsum(
+            einsum_str="BTD,DKH->BTKH",
+            shape=(cfg.emb_dim, cfg.num_kv_heads, cfg.head_dim),
+            shd=self.shd_cfg.kv_weight_ndh,
+            rngs=rngs,
+            use_bias=True,
+        )
+        # v_proj: [B, T, D] @ [D, K*H] -> [B, T, K*H] -> reshape to [B, T, K, H]
+        self.v_proj = Einsum(
+            einsum_str="BTD,DKH->BTKH",
+            shape=(cfg.emb_dim, cfg.num_kv_heads, cfg.head_dim),
+            shd=self.shd_cfg.kv_weight_ndh,
+            rngs=rngs,
+            use_bias=True,
+        )
+        # o_proj: [B, T, N, H] -> [B, T, N*H] @ [N*H, D] -> [B, T, D]
+        self.o_proj = Einsum(
+            einsum_str="BTNH,NHD->BTD",
+            shape=(cfg.num_heads, cfg.head_dim, cfg.emb_dim),
+            shd=self.shd_cfg.o_weight_nhd,
+            rngs=rngs,
+            use_bias=False,
+        )
 
         self.cfg = cfg
         self.n_rep = cfg.num_heads // cfg.num_kv_heads
@@ -162,19 +199,12 @@ class Attention(nnx.Module):
 
     @jax.named_scope("attention")
     def __call__(self, x: Array, cache: LayerCache | None, segment_ids: Array) -> Array:
-        # Linear projections
-        q_linear = self.q_proj(x)
-        k_linear = self.k_proj(x)
-        v_linear = self.v_proj(x)
-        b, t, _ = q_linear.shape
-        query_proj = q_linear.reshape(b, t, self.cfg.num_heads, self.cfg.head_dim)  # [B, T, N, H]
-        key_proj = k_linear.reshape(b, t, self.cfg.num_kv_heads, self.cfg.head_dim)  # [B, T, K, H]
-        value_proj = v_linear.reshape(b, t, self.cfg.num_kv_heads, self.cfg.head_dim)  # [B, T, K, H]
+        # Linear projections - Einsum directly outputs [B, T, N/K, H] shape
+        query_proj = shard(self.q_proj(x), self.shd_cfg.act_btnh)  # [B, T, N, H]
+        key_proj = shard(self.k_proj(x), self.shd_cfg.act_btnh)  # [B, T, K, H]
+        value_proj = shard(self.v_proj(x), self.shd_cfg.act_btnh)  # [B, T, K, H]
 
-        # Apply sharding
-        query_proj = shard(query_proj, self.shd_cfg.act_btnh)
-        key_proj = shard(key_proj, self.shd_cfg.act_btnh)
-        value_proj = shard(value_proj, self.shd_cfg.act_btnh)
+        b, t = x.shape[:2]
 
         # RoPE and Cache Logic
         left_pads = count_left_pads(segment_ids)
@@ -185,10 +215,11 @@ class Attention(nnx.Module):
         query_proj = apply_rope(query_proj, sin, cos)
         key_proj = apply_rope(key_proj, sin, cos)
 
-        # Ensure dtype matches cache (convert to cache dtype)
+        # Ensure dtype matches cache and preserve sharding
+        # astype can break sharding, so re-shard after dtype conversion
         cache_dtype = cache.k_cache.dtype
-        value_proj = value_proj.astype(cache_dtype)
-        key_proj = key_proj.astype(cache_dtype)
+        value_proj = shard(value_proj.astype(cache_dtype), self.shd_cfg.act_btnh)
+        key_proj = shard(key_proj.astype(cache_dtype), self.shd_cfg.act_btnh)
 
         # Update K/V cache [B, S, K, H]
         slice_indices = (0, cache.cur_ind.value, 0, 0)
@@ -217,9 +248,7 @@ class Attention(nnx.Module):
         qkv = jnp.einsum("BTSKG,BSKH->BTKGH", attn_weights, cache.v_cache.value)
         qkv = qkv.reshape((b, t, n, h))
 
-        # Reshape for o_proj: (B, T, N, H) -> (B, T, N*H)
-        qkv = qkv.reshape((b, t, n * h))
-
+        # o_proj expects [B, T, N, H] and produces [B, T, D]
         output = self.o_proj(qkv)
 
         cache.cur_ind.value = cache.cur_ind.value + t
@@ -254,6 +283,7 @@ class DecoderLayer(nnx.Module):
 
 class Qwen2(nnx.Module):
     def __init__(self, cfg: ModelConfig, *, rngs: nnx.Rngs):
+        self.shd_cfg = cfg.shd_cfg
         self.embedder = shard(
             nnx.Embed(num_embeddings=cfg.vocab_size, features=cfg.emb_dim, dtype=jnp.bfloat16, rngs=rngs),
             cfg.shd_cfg.emb_vd,
@@ -271,26 +301,30 @@ class Qwen2(nnx.Module):
         cache_size = 2 ** math.ceil(math.log2(max(token_len + generate_steps, 1)))
         return [LayerCache(cfg, batch_size, cache_size, dtype) for _ in range(cfg.num_layers)]
 
-    @nnx.jit
-    def forward(self, cache: Cache, tokens: Array, pad_id: int, vocab_limit: int = 151643) -> tuple[Array, Cache]:
-        segment_ids = 1 * (tokens != pad_id)
-        num_right_pads = count_right_pads(tokens, pad_id)
-        logits = self(tokens, segment_ids, cache, num_right_pads)
-        target_ind = tokens.shape[-1] - num_right_pads - 1
-
-        mask = jnp.arange(logits.shape[-1]) >= vocab_limit
-        logits = jnp.where(mask[None, :], -jnp.inf, logits)
-
-        return logits[:, target_ind], cache
-
     def __call__(self, tokens, segment_ids, cache, num_right_pads):
         x = self.embedder.embedding.value.at[(tokens,)].get(out_sharding=self.out_emb_shd)
         for i, layer in enumerate(self.layers):
             x = layer(x, cache[i], segment_ids)
         logits = self.lm_head(self.final_norm(x))
+
+        # For generation/sampling, replicate all dimensions across devices
+        # This will trigger automatic all-gather to prepare for sampling
+        if not get_abstract_mesh().empty:
+            # logits shape: [B, T, V], replicate all dims for sampling compatibility
+            logits = shard(logits, P(None, None, None))
+
         return logits
 
+#
+# def forward(model: Qwen2, cache: Cache, tokens: Array, pad_id: int, vocab_limit: int = 151643) -> tuple[Array, Cache]:
+#     """Backward compatibility wrapper. Use model.forward() instead."""
+#     return model.forward(cache, tokens, pad_id, vocab_limit)
 
-def forward(model: Qwen2, cache: Cache, tokens: Array, pad_id: int, vocab_limit: int = 151643) -> tuple[Array, Cache]:
-    """Backward compatibility wrapper. Use model.forward() instead."""
-    return model.forward(cache, tokens, pad_id, vocab_limit)
+
+@jax.jit
+def forward(model: nnx.Module, cache: Cache, tokens: Array, pad_id: int) -> tuple[Array, nnx.Cache]:
+    segment_ids = 1 * (tokens != pad_id)
+    num_right_pads = count_right_pads(tokens, pad_id)
+    logits = model(tokens, segment_ids, cache, num_right_pads)
+    target_ind = tokens.shape[-1] - num_right_pads - 1
+    return logits[:, target_ind], cache

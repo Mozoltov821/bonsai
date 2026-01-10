@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import P
+from jax._src.mesh import AxisType
 from transformers import AutoTokenizer
 
 from bonsai.models.qwen2 import modeling, params
@@ -24,15 +25,16 @@ def tokenize(tokenizer, input: list[str], shd: P | None = None):
 
 def run_model():
     model_ckpt_path = os.path.expanduser("~/.cache/modelscope/hub/models/Qwen/Qwen2-0.5B")
-    config = modeling.ModelConfig.qwen2_0_5b(use_sharding=False)
-    mesh, batch_shd = None, None
+    # config = modeling.ModelConfig.qwen2_0_5b(use_sharding=False)
+    # mesh, batch_shd = None, None
 
     # Enable sharding below if you have multiple devices.
     # model_ckpt_path = snapshot_download("Qwen/Qwen2-7B")
     # config = modeling.ModelConfig.qwen2_7b(use_sharding=True)
-    # mesh = jax.make_mesh((2, 2), ("fsdp", "tp"), axis_types=(AxisType.Explicit, AxisType.Explicit))
-    # batch_shd = P("fsdp", None)
-    # jax.set_mesh(mesh)
+    config = modeling.ModelConfig.qwen2_0_5b(use_sharding=True)
+    mesh = jax.make_mesh((1, 2), ("fsdp", "tp"), axis_types=(AxisType.Explicit, AxisType.Explicit))
+    batch_shd = P("fsdp", None)
+    jax.set_mesh(mesh)
 
     query = [
         "天空为什么是蓝色的？",
