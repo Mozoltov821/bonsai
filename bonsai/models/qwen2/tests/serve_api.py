@@ -43,6 +43,7 @@ class ChatCompletionRequest(BaseModel):
     top_k: int = 10
     max_tokens: int = 2048
     stream: bool = False
+    use_chat_template: bool = True  # Default to False for evaluation tasks
 
 
 class CompletionRequest(BaseModel):
@@ -100,10 +101,17 @@ class Qwen2Server:
         self.pad_id = self.tokenizer.pad_token_id
         self.eos_id = self.tokenizer.eos_token_id
 
+        # Get im_end token ID for chat completion
+        # Qwen2 uses <|im_end|> to mark the end of assistant responses
+        im_end_token = self.tokenizer.encode("<|im_end|>", add_special_tokens=False)
+        self.im_end_id = im_end_token[0] if im_end_token else None
+        print(f"EOS token ID: {self.eos_id}")
+        print(f"IM_END token ID: {self.im_end_id}")
+
         # JIT compile forward for better performance
         print("Compiling forward function with JIT...")
 
-        @jax.jit
+        # @jax.jit
         def forward_jit(model, cache, tokens, pad_id):
             return modeling.forward(model, cache, tokens, pad_id)
 
@@ -124,12 +132,30 @@ class Qwen2Server:
             [np.pad(l, (max_len - len(l), 0), constant_values=self.pad_id) for l in lines]
         )
 
-    def tokenize_chat(self, messages: list[ChatMessage]) -> jnp.ndarray:
+    def tokenize_chat(self, messages: list[ChatMessage], use_chat_template: bool = True) -> jnp.ndarray:
         """Tokenize chat messages using chat template."""
         chat_messages = [{"role": msg.role, "content": msg.content} for msg in messages]
-        text = self.tokenizer.apply_chat_template(
-            chat_messages, tokenize=False, add_generation_prompt=True
-        )
+
+        if use_chat_template:
+            text = self.tokenizer.apply_chat_template(
+                chat_messages, tokenize=False, add_generation_prompt=True
+            )
+            # Debug: print the formatted prompt
+            print("\n" + "="*80)
+            print("🔍 DEBUG: Formatted prompt sent to model (with chat template):")
+            print("="*80)
+            print(text)
+            print("="*80 + "\n")
+        else:
+            # For evaluation: just concatenate messages without chat template
+            # This preserves the exact few-shot format
+            text = "\n\n".join([msg.content for msg in messages])
+            print("\n" + "="*80)
+            print("🔍 DEBUG: Raw prompt sent to model (no chat template):")
+            print("="*80)
+            print(text)
+            print("="*80 + "\n")
+
         return self.tokenize([text])
 
     def generate(
@@ -139,6 +165,7 @@ class Qwen2Server:
         temperature: float = 1.0,
         top_p: float = 0.8,
         top_k: int = 10,
+        check_im_end: bool = True,  # New parameter to control im_end checking
     ) -> tuple[jnp.ndarray, int]:
         """Generate tokens using the model."""
         batch_size, token_len = tokens.shape
@@ -157,7 +184,8 @@ class Qwen2Server:
         key = jax.random.key(int(time.time() * 1000) % 2**32)
 
         # Prefill
-        logits, cache = self.model.forward(cache, tokens, self.pad_id)
+        # logits, cache = self.model.forward(cache, tokens, self.pad_id)
+        logits, cache = modeling.forward(self.model, cache, tokens, self.pad_id)
         next_tokens = sampler_fn(logits, key=key)
 
         # Decode
@@ -165,9 +193,18 @@ class Qwen2Server:
         finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
 
         for _ in range(max_tokens):
-            logits, cache = self.model.forward(cache, next_tokens, self.pad_id)
+            logits, cache = modeling.forward(self.model, cache, next_tokens, self.pad_id)
             next_tokens = sampler_fn(logits, key=key)
-            finished = finished | (next_tokens.squeeze(-1) == self.eos_id)
+
+            # Check for both EOS and IM_END tokens
+            is_eos = next_tokens.squeeze(-1) == self.eos_id
+            is_im_end = (
+                (next_tokens.squeeze(-1) == self.im_end_id)
+                if (check_im_end and self.im_end_id is not None)
+                else jnp.zeros_like(finished)
+            )
+            finished = finished | is_eos | is_im_end
+
             tokens_list.append(next_tokens)
             if finished.all():
                 break
@@ -233,9 +270,20 @@ async def chat_completion(request: ChatCompletionRequest):
     if server is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
+    # Print incoming request
+    print("\n" + "="*80)
+    print("📥 CHAT COMPLETION REQUEST")
+    print("="*80)
+    for msg in request.messages:
+        print(f"[{msg.role}]: {msg.content}")
+    print(f"Temperature: {request.temperature}, Top-P: {request.top_p}, Top-K: {request.top_k}")
+    print(f"Max tokens: {request.max_tokens}")
+    print(f"Use chat template: {request.use_chat_template}")
+    print("-"*80)
+
     try:
         # Tokenize
-        tokens = server.tokenize_chat(request.messages)
+        tokens = server.tokenize_chat(request.messages, use_chat_template=request.use_chat_template)
         prompt_tokens = tokens.shape[1]
 
         # Generate
@@ -245,16 +293,40 @@ async def chat_completion(request: ChatCompletionRequest):
             temperature=request.temperature,
             top_p=request.top_p,
             top_k=request.top_k,
+            check_im_end=request.use_chat_template,  # Only check im_end when using chat template
         )
 
         # Decode
         seq_tokens = output_tokens[0]
+
+        # Find first occurrence of EOS or IM_END
         eos_idx = np.where(seq_tokens == server.eos_id)[0]
+        im_end_idx = np.where(seq_tokens == server.im_end_id)[0] if server.im_end_id is not None else np.array([])
+
+        # Use the earliest stopping token
+        stop_indices = []
         if eos_idx.size > 0:
-            seq_tokens = seq_tokens[: eos_idx[0]]
+            stop_indices.append(eos_idx[0])
+        if im_end_idx.size > 0:
+            stop_indices.append(im_end_idx[0])
+
+        if stop_indices:
+            seq_tokens = seq_tokens[: min(stop_indices)]
 
         response_text = server.tokenizer.decode(seq_tokens, skip_special_tokens=True)
         completion_tokens = len(seq_tokens)
+        stopped = len(stop_indices) > 0
+
+        # Print response
+        print("📤 CHAT COMPLETION RESPONSE")
+        print("-"*80)
+        print(f"[assistant]: {response_text}")
+        print("-"*80)
+        print(f"✅ Tokens generated: {completion_tokens}")
+        print(f"   Prompt tokens: {prompt_tokens}")
+        print(f"   Total tokens: {prompt_tokens + completion_tokens}")
+        print(f"   Finish reason: {'stop' if stopped else 'length'}")
+        print("="*80 + "\n")
 
         return ChatCompletionResponse(
             id=f"chatcmpl-{int(time.time() * 1000)}",
@@ -264,7 +336,7 @@ async def chat_completion(request: ChatCompletionRequest):
                 {
                     "index": 0,
                     "message": {"role": "assistant", "content": response_text},
-                    "finish_reason": "stop" if eos_idx.size > 0 else "length",
+                    "finish_reason": "stop" if stopped else "length",
                 }
             ],
             usage={
@@ -284,9 +356,19 @@ async def completion(request: CompletionRequest):
     if server is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
+    # Print incoming request
+    print("\n" + "="*80)
+    print("📥 TEXT COMPLETION REQUEST")
+    print("="*80)
+    prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
+    for i, prompt in enumerate(prompts):
+        print(f"Prompt {i+1}: {prompt}")
+    print(f"Temperature: {request.temperature}, Top-P: {request.top_p}, Top-K: {request.top_k}")
+    print(f"Max tokens: {request.max_tokens}")
+    print("-"*80)
+
     try:
         # Handle both single and batch prompts
-        prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
         tokens = server.tokenize(prompts)
         prompt_tokens = tokens.shape[1]
 
@@ -302,9 +384,21 @@ async def completion(request: CompletionRequest):
         # Decode all responses
         choices = []
         for i, seq_tokens in enumerate(output_tokens):
+            # Find first occurrence of EOS or IM_END
             eos_idx = np.where(seq_tokens == server.eos_id)[0]
+            im_end_idx = np.where(seq_tokens == server.im_end_id)[0] if server.im_end_id is not None else np.array([])
+
+            # Use the earliest stopping token
+            stop_indices = []
             if eos_idx.size > 0:
-                seq_tokens = seq_tokens[: eos_idx[0]]
+                stop_indices.append(eos_idx[0])
+            if im_end_idx.size > 0:
+                stop_indices.append(im_end_idx[0])
+
+            stopped = False
+            if stop_indices:
+                seq_tokens = seq_tokens[: min(stop_indices)]
+                stopped = True
 
             response_text = server.tokenizer.decode(seq_tokens, skip_special_tokens=True)
 
@@ -312,11 +406,23 @@ async def completion(request: CompletionRequest):
                 {
                     "index": i,
                     "text": response_text,
-                    "finish_reason": "stop" if eos_idx.size > 0 else "length",
+                    "finish_reason": "stop" if stopped else "length",
                 }
             )
 
         completion_tokens = sum(len(c["text"].split()) for c in choices)
+
+        # Print response
+        print("📤 TEXT COMPLETION RESPONSE")
+        print("-"*80)
+        for i, choice in enumerate(choices):
+            print(f"Response {i+1}: {choice['text']}")
+            print(f"  Finish reason: {choice['finish_reason']}")
+        print("-"*80)
+        print(f"✅ Total tokens generated: {completion_tokens}")
+        print(f"   Prompt tokens: {prompt_tokens}")
+        print(f"   Total tokens: {prompt_tokens + completion_tokens}")
+        print("="*80 + "\n")
 
         return CompletionResponse(
             id=f"cmpl-{int(time.time() * 1000)}",
