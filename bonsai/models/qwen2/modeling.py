@@ -53,6 +53,7 @@ class ModelConfig:
     rope_theta: int
     norm_eps: float
     tie_word_embeddings: bool
+    use_causal_mask: bool = True  # False for bidirectional attention
     shd_cfg: ShardingCfg = ShardingCfg.no_sharding()
 
     @classmethod
@@ -237,9 +238,18 @@ class Attention(nnx.Module):
         ts = jnp.arange(cache.size, dtype=jnp.int32)  # (cache.size,)
         kv_segment_ids = (ts[None, :] >= cache.start_ind.value[:, None]) & (ts[None, :] < cache.cur_ind.value + t)
         k_pos = ts[None, :] - cache.start_ind.value[:, None]  # (b, cache.size)
-        causal_mask = k_pos[:, None, :] <= q_pos[:, :, None]
+
+        # Segment mask (always applied)
         segment_mask = kv_segment_ids[:, None, :] == segment_ids[:, :, None]
-        final_mask = causal_mask & segment_mask  # (B, T, S)
+
+        # Conditionally apply causal masking
+        if self.cfg.use_causal_mask:
+            causal_mask = k_pos[:, None, :] <= q_pos[:, :, None]
+            final_mask = causal_mask & segment_mask  # (B, T, S)
+        else:
+            # Bidirectional attention: only use segment mask
+            final_mask = segment_mask  # (B, T, S)
+
         attn_mask = final_mask[:, :, :, None, None]
         attn_logits = jnp.where(attn_mask, attn_logits, _K_MASK)
 
