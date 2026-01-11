@@ -626,7 +626,9 @@ class FlaxMiMoAudioTokenizer(nnx.Module):
 
     def decode(self, codes: Array) -> Array:
         hidden = self.encoder.decode_vq(codes)
-        hidden = hidden[None, ...].astype(jnp.bfloat16)
+        # ✅ 修复：保持float32精度，不转换为bfloat16
+        # PyTorch实现也保持decode_vq的float32输出，确保音频质量
+        hidden = hidden[None, ...]  # 只添加batch dimension，不改变dtype
         lengths = jnp.array([hidden.shape[1]])
         return self.decoder(hidden, lengths)
 

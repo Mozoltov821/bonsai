@@ -148,7 +148,8 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
             self,
             config: MiMoAudioConfig,
             args: MiMoAudioArguments,
-            rngs: Optional[nnx.Rngs] = None
+            rngs: Optional[nnx.Rngs] = None,
+            dtype: jnp.dtype = jnp.bfloat16,  # ✅ 恢复：默认bfloat16节省内存
     ):
         if rngs is None:
             rngs = nnx.Rngs(0)
@@ -187,18 +188,20 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
                 config.local_dim,
                 self.speech_vocab_sizes[i],
                 use_bias=False,
-                dtype=jnp.bfloat16,
+                dtype=dtype,  # ✅ 使用传入的dtype而不是硬编码bfloat16
                 rngs=rngs
             )
             for i in range(self.audio_channels)
         ])
 
         # Speech embeddings for each audio channel
+        # ⚠️  关键：使用float32保持累加精度，避免tokens重复
+        # PyTorch实现中embeddings累加也保持较高精度
         self.speech_embeddings = nnx.List([
             nnx.Embed(
                 self.speech_vocab_sizes[i],
                 config.input_local_dim,
-                dtype=jnp.bfloat16,
+                dtype=jnp.float32,  # 使用float32保持累加精度
                 rngs=rngs
             )
             for i in range(self.audio_channels)
@@ -210,7 +213,7 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
                 config.input_local_dim,
                 config.local_dim,
                 use_bias=False,
-                dtype=jnp.bfloat16,
+                dtype=dtype,  # ✅ 使用传入的dtype而不是硬编码bfloat16
                 rngs=rngs
             )
         else:
@@ -478,11 +481,13 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
 
         # ✅ 关键修复：每次调用都创建新的 cache（与官方实现一致）
         # 官方实现：past_key_values = DynamicCache() 每次都是新的
+        # token_len=1: 每次迭代只输入1个token
+        # generate_steps: 总共需要delay_iters个位置，已有1个，还需delay_iters-1个
         cache = self.local_transformer.init_cache(
             self.local_qwen2_config,
             B,
-            token_len=delay_iters,  # 设置为实际需要的长度
-            generate_steps=0,
+            token_len=1,  # 每次只输入1个token
+            generate_steps=delay_iters - 1,  # 还需要生成delay_iters-1个token的空间
             dtype=jnp.bfloat16,
         )
 
@@ -510,14 +515,25 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
                     cur_lm_head = self.local_transformer_lm_heads[idx]
                     cur_logits = cur_lm_head(hidden_state[:, -1, :])  # [B, vocab_size]
 
-                    # 调试：检查logits范围和分布（仅第一次，第一个通道）
-                    if t == 0 and idx == 0:
-                        import jax
-                        logits_mean = float(jnp.mean(cur_logits))
-                        logits_std = float(jnp.std(cur_logits))
-                        logits_min = float(jnp.min(cur_logits))
-                        logits_max = float(jnp.max(cur_logits))
-                        # 这些值会在JIT编译后可能不会打印，但可以帮助调试
+                    # 🔍 调试：打印每个通道的logits统计（仅第一个时间步）
+                    if t == cur_start:  # 每个通道的第一个token
+                        logits_np = jnp.array(cur_logits[0])  # [vocab_size]
+                        print(f"\n通道{idx} (t={t}) logits统计:")
+                        print(f"  Mean: {float(jnp.mean(logits_np)):.4f}")
+                        print(f"  Std:  {float(jnp.std(logits_np)):.4f}")
+                        print(f"  Min:  {float(jnp.min(logits_np)):.4f}")
+                        print(f"  Max:  {float(jnp.max(logits_np)):.4f}")
+
+                        # 打印Top-5 logits和对应的token
+                        top5_indices = jnp.argsort(logits_np)[-5:][::-1]
+                        top5_values = logits_np[top5_indices]
+                        print(f"  Top-5 tokens: {[int(i) for i in top5_indices]}")
+                        print(f"  Top-5 logits: {[float(v) for v in top5_values]}")
+
+                        # 计算entropy（diversity指标）
+                        probs = jax.nn.softmax(logits_np)
+                        entropy = -jnp.sum(probs * jnp.log(probs + 1e-10))
+                        print(f"  Entropy: {float(entropy):.4f} (higher = more diverse)")
 
                     # Sample token
                     key, subkey = jax.random.split(key)

@@ -85,6 +85,7 @@ def create_model_with_weights(
     config,
     args,
     rngs: nnx.Rngs | None = None,
+    dtype: Any = jnp.bfloat16,  # ✅ 恢复：默认bfloat16节省内存，关键部分特殊处理
 ) -> Any:
     """Create MiMo Audio model and load weights from safetensors."""
     import os
@@ -100,7 +101,7 @@ def create_model_with_weights(
     from bonsai.models.mimo_audio.modeling import FlaxMiMoAudioForCausalLM
 
     # Create model with eval_shape (memory efficient)
-    model = nnx.eval_shape(lambda: FlaxMiMoAudioForCausalLM(config, args, nnx.Rngs(0)))
+    model = nnx.eval_shape(lambda: FlaxMiMoAudioForCausalLM(config, args, nnx.Rngs(0), dtype=dtype))
     graph_def, abs_state = nnx.split(model)
     pure_state_dict = abs_state.to_pure_dict()
 
@@ -163,7 +164,8 @@ def create_model_with_weights(
 
         keys = [_stoi(k) for k in jax_key.split(".")]
         try:
-            tensor_jax = jnp.asarray(tensor, dtype=jnp.bfloat16)
+            # ✅ 修复：使用传入的dtype而不是硬编码bfloat16
+            tensor_jax = jnp.asarray(tensor, dtype=dtype)
             _assign_weights(keys, tensor_jax, pure_state_dict, torch_key, transform, None)
             loaded_count += 1
         except KeyError as e:
