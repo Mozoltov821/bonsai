@@ -8,17 +8,37 @@ from flax import nnx
 from bonsai.models.qwen2.params import Transform, TRANSFORM_LINEAR, TRANSFORM_NONE, _stoi, _assign_weights
 
 
-def _get_qwen2_key_mapping(prefix: str) -> dict[str, tuple[str, Transform]]:
+def _get_qwen2_key_mapping(prefix: str, num_heads: int, num_kv_heads: int, emb_dim: int, head_dim: int) -> dict[str, tuple[str, Transform]]:
     """Generate key mapping for Qwen2 submodules with prefix."""
+    # Define transforms for Einsum weights (need reshape to 3D)
+    q_reshape = Transform(
+        permute=(1, 0),
+        reshape=(emb_dim, num_heads, head_dim),
+        reshape_first=False,
+    )
+    kv_reshape = Transform(
+        permute=(1, 0),
+        reshape=(emb_dim, num_kv_heads, head_dim),
+        reshape_first=False,
+    )
+    o_reshape = Transform(
+        permute=(1, 0),
+        reshape=(num_heads, head_dim, emb_dim),
+        reshape_first=False,
+    )
+    # Bias transforms
+    q_bias_reshape = Transform(reshape=(num_heads, head_dim))
+    kv_bias_reshape = Transform(reshape=(num_kv_heads, head_dim))
+
     return {
         rf"{prefix}\.embed_tokens\.weight": (f"{prefix}.embedder.embedding", TRANSFORM_NONE),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.q_proj\.weight": (rf"{prefix}.layers.\1.attn.q_proj.kernel", TRANSFORM_LINEAR),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.k_proj\.weight": (rf"{prefix}.layers.\1.attn.k_proj.kernel", TRANSFORM_LINEAR),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.v_proj\.weight": (rf"{prefix}.layers.\1.attn.v_proj.kernel", TRANSFORM_LINEAR),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.o_proj\.weight": (rf"{prefix}.layers.\1.attn.o_proj.kernel", TRANSFORM_LINEAR),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.q_proj\.bias": (rf"{prefix}.layers.\1.attn.q_proj.bias", TRANSFORM_NONE),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.k_proj\.bias": (rf"{prefix}.layers.\1.attn.k_proj.bias", TRANSFORM_NONE),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.v_proj\.bias": (rf"{prefix}.layers.\1.attn.v_proj.bias", TRANSFORM_NONE),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.q_proj\.weight": (rf"{prefix}.layers.\1.attn.q_proj.w", q_reshape),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.k_proj\.weight": (rf"{prefix}.layers.\1.attn.k_proj.w", kv_reshape),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.v_proj\.weight": (rf"{prefix}.layers.\1.attn.v_proj.w", kv_reshape),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.o_proj\.weight": (rf"{prefix}.layers.\1.attn.o_proj.w", o_reshape),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.q_proj\.bias": (rf"{prefix}.layers.\1.attn.q_proj.bias", q_bias_reshape),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.k_proj\.bias": (rf"{prefix}.layers.\1.attn.k_proj.bias", kv_bias_reshape),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.v_proj\.bias": (rf"{prefix}.layers.\1.attn.v_proj.bias", kv_bias_reshape),
         rf"{prefix}\.layers\.([0-9]+)\.mlp\.gate_proj\.weight": (rf"{prefix}.layers.\1.mlp.gate_proj.kernel", TRANSFORM_LINEAR),
         rf"{prefix}\.layers\.([0-9]+)\.mlp\.up_proj\.weight": (rf"{prefix}.layers.\1.mlp.up_proj.kernel", TRANSFORM_LINEAR),
         rf"{prefix}\.layers\.([0-9]+)\.mlp\.down_proj\.weight": (rf"{prefix}.layers.\1.mlp.down_proj.kernel", TRANSFORM_LINEAR),
@@ -103,9 +123,34 @@ def create_model_with_weights(
 
     # Build key mapping
     full_mapping = {}
-    full_mapping.update(_get_qwen2_key_mapping("model"))
-    full_mapping.update(_get_qwen2_key_mapping("local_transformer"))
-    full_mapping.update(_get_qwen2_key_mapping("input_local_transformer"))
+
+    # Main model mapping (model prefix)
+    full_mapping.update(_get_qwen2_key_mapping(
+        "model",
+        num_heads=config.num_attention_heads,
+        num_kv_heads=config.num_key_value_heads,
+        emb_dim=config.hidden_size,
+        head_dim=config.head_dim,
+    ))
+
+    # Local transformer mapping
+    full_mapping.update(_get_qwen2_key_mapping(
+        "local_transformer",
+        num_heads=config.local_attn_heads,
+        num_kv_heads=config.local_attn_heads,
+        emb_dim=config.local_dim,
+        head_dim=config.local_dim // config.local_attn_heads,
+    ))
+
+    # Input local transformer mapping
+    full_mapping.update(_get_qwen2_key_mapping(
+        "input_local_transformer",
+        num_heads=config.local_attn_heads,
+        num_kv_heads=config.local_attn_heads,
+        emb_dim=config.input_local_dim,
+        head_dim=config.input_local_dim // config.local_attn_heads,
+    ))
+
     full_mapping.update(_get_mimo_key_mapping(config.audio_channels))
 
     conversion_errors = []
