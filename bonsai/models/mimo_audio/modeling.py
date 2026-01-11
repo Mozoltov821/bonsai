@@ -269,6 +269,11 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
 
     def _create_input_local_qwen2_config(self, config: MiMoAudioConfig) -> Qwen2Config:
         """Create input local transformer Qwen2 config"""
+        # Convert input_full_attention to use_causal_mask
+        # input_full_attention=True -> use_causal_mask=False (bidirectional)
+        # input_full_attention=False/None -> use_causal_mask=True (causal, backward compatible)
+        use_causal_mask = not config.input_full_attention if config.input_full_attention is not None else True
+
         return Qwen2Config(
             num_layers=config.input_local_layers,
             vocab_size=config.vocab_size,
@@ -280,6 +285,7 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
             rope_theta=10000,
             norm_eps=1e-6,
             tie_word_embeddings=False,
+            use_causal_mask=use_causal_mask,
         )
 
     def apply_input_local_transformer(
