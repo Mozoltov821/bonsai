@@ -294,10 +294,12 @@ class ISTFT(nnx.Module):
             return audio_acc, env_acc
 
         audio, env = jax.lax.fori_loop(0, num_frames, body, (audio, env))
-        env = jnp.maximum(env, 1e-11)
-        audio = audio / env
+        # Trim padding before normalization (align with PyTorch implementation)
         if self.pad > 0:
             audio = audio[:, self.pad: -self.pad]
+            env = env[:, self.pad: -self.pad]
+        env = jnp.maximum(env, 1e-11)
+        audio = audio / env
         return audio
 
 
