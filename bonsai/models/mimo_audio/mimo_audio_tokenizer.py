@@ -314,8 +314,6 @@ class ISTFTHead(nnx.Module):
         x = jnp.swapaxes(x, 1, 2)
         mag, phase = jnp.split(x, 2, axis=1)
 
-        # ✅ 与 PyTorch 对齐：显式转换为 float32 进行数值计算
-        # bfloat16 在 exp/cos/sin 等超越函数中精度不足，导致音频失真
         original_dtype = hidden_states.dtype
         mag = mag.astype(jnp.float32)
         phase = phase.astype(jnp.float32)
@@ -326,7 +324,6 @@ class ISTFTHead(nnx.Module):
         spec = mag * (real + 1j * imag)
 
         audio = self.istft(spec)
-        # 转回原始 dtype（如果需要）
         audio = audio.astype(original_dtype)
         return audio
 
@@ -639,8 +636,6 @@ class FlaxMiMoAudioTokenizer(nnx.Module):
 
     def decode(self, codes: Array) -> Array:
         hidden = self.encoder.decode_vq(codes)
-        # ✅ 修复：保持float32精度，不转换为bfloat16
-        # PyTorch实现也保持decode_vq的float32输出，确保音频质量
         hidden = hidden[None, ...]  # 只添加batch dimension，不改变dtype
         lengths = jnp.array([hidden.shape[1]])
         return self.decoder(hidden, lengths)
