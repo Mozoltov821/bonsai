@@ -311,11 +311,22 @@ class ISTFTHead(nnx.Module):
         x = self.linear(hidden_states)
         x = jnp.swapaxes(x, 1, 2)
         mag, phase = jnp.split(x, 2, axis=1)
+
+        # ✅ 与 PyTorch 对齐：显式转换为 float32 进行数值计算
+        # bfloat16 在 exp/cos/sin 等超越函数中精度不足，导致音频失真
+        original_dtype = hidden_states.dtype
+        mag = mag.astype(jnp.float32)
+        phase = phase.astype(jnp.float32)
+
         mag = jnp.clip(jnp.exp(mag), a_max=1e2)
         real = jnp.cos(phase)
         imag = jnp.sin(phase)
         spec = mag * (real + 1j * imag)
-        return self.istft(spec)
+
+        audio = self.istft(spec)
+        # 转回原始 dtype（如果需要）
+        audio = audio.astype(original_dtype)
+        return audio
 
 
 class Attention(nnx.Module):
