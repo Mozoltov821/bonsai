@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from bonsai.models.qwen2.modeling import Qwen2, ModelConfig as Qwen2Config, Cache
+from bonsai.utils.samplers import Sampler, GreedySampler
 
 
 @dataclass
@@ -83,44 +84,15 @@ class MiMoSampler:
 
     def __init__(self, config: MiMoSamplerConfig):
         self.config = config
-
-    def process_logits(self, logits: jnp.ndarray) -> jnp.ndarray:
-        """Apply temperature, top_k, top_p filtering to logits"""
-        if self.config.temperature is not None and self.config.temperature != 1.0:
-            logits = logits / self.config.temperature
-
-        # Top-k filtering
-        if self.config.top_k is not None and self.config.top_k > 0:
-            top_k = min(self.config.top_k, logits.shape[-1])
-            # Get top_k values
-            top_k_vals = jax.lax.top_k(logits, top_k)[0]
-            threshold = top_k_vals[:, -1:]
-            logits = jnp.where(logits < threshold, -jnp.inf, logits)
-
-        # Top-p (nucleus) filtering
-        if self.config.top_p is not None and 0.0 < self.config.top_p < 1.0:
-            sorted_indices = jnp.argsort(logits, axis=-1)[:, ::-1]
-            sorted_logits = jnp.take_along_axis(logits, sorted_indices, axis=-1)
-
-            cumulative_probs = jnp.cumsum(jax.nn.softmax(sorted_logits, axis=-1), axis=-1)
-
-            # Remove tokens with cumulative probability above threshold
-            sorted_indices_to_remove = cumulative_probs > self.config.top_p
-            # Shift right to keep first token above threshold
-            sorted_indices_to_remove = jnp.concatenate([
-                jnp.zeros_like(sorted_indices_to_remove[:, :1]),
-                sorted_indices_to_remove[:, :-1]
-            ], axis=-1)
-
-            # Scatter back to original indexing
-            indices_to_remove = jnp.zeros_like(logits, dtype=bool)
-            indices_to_remove = indices_to_remove.at[
-                jnp.arange(logits.shape[0])[:, None], sorted_indices
-            ].set(sorted_indices_to_remove)
-
-            logits = jnp.where(indices_to_remove, -jnp.inf, logits)
-
-        return logits
+        # 根据config创建对应的utils sampler
+        if config.do_sample:
+            self._sampler = Sampler(
+                temperature=config.temperature,
+                top_k=config.top_k,
+                top_p=config.top_p
+            )
+        else:
+            self._sampler = GreedySampler()
 
     def sample(
             self,
@@ -128,19 +100,20 @@ class MiMoSampler:
             key: jax.random.PRNGKey,
             removed_tokens: Optional[List[int]] = None
     ) -> jnp.ndarray:
-        """Sample next token from logits"""
-        logits = self.process_logits(logits)
+        """Sample next token from logits
 
-        # Mask removed tokens
+        Wrapper around utils.samplers with removed_tokens support.
+        """
+        # 1. Handle removed_tokens (MiMo特有功能)
         if removed_tokens:
             for t in removed_tokens:
                 logits = logits.at[:, t].set(-jnp.inf)
 
-        if self.config.do_sample:
-            # jax.random.categorical expects logits (unnormalized log probs), not probs
-            return jax.random.categorical(key, logits, axis=-1)
-        else:
-            return jnp.argmax(logits, axis=-1)
+        # 2. Call utils sampler
+        result = self._sampler(logits, key=key)  # [B, 1]
+
+        # 3. Reshape to match original API: [B, 1] → [B]
+        return result[:, 0]
 
 
 class FlaxMiMoAudioForCausalLM(nnx.Module):
