@@ -1050,8 +1050,10 @@ class EndToEndTester:
 
             # 创建 sampler（使用官方推荐参数）
             from bonsai.models.mimo_audio.modeling import MiMoSampler, MiMoSamplerConfig
-            text_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.6, top_k=50, top_p=1.0, do_sample=True))
-            audio_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.9, top_k=50, top_p=0.95, do_sample=True))
+            # text_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.6, top_k=50, top_p=1.0, do_sample=True))
+            # audio_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.9, top_k=50, top_p=0.95, do_sample=True))
+            text_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.6, top_k=50, top_p=1.0, do_sample=False))
+            audio_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.9, top_k=50, top_p=0.95, do_sample=False))
 
             # Random key for sampling
             rng_key = jax.random.key(42)
