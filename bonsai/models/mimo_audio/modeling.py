@@ -521,26 +521,6 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
                     cur_lm_head = self.local_transformer_lm_heads[idx]
                     cur_logits = cur_lm_head(hidden_state[:, -1, :])  # [B, vocab_size]
 
-                    # 🔍 调试：打印每个通道的logits统计（仅第一个时间步）
-                    if t == cur_start:  # 每个通道的第一个token
-                        logits_np = jnp.array(cur_logits[0])  # [vocab_size]
-                        print(f"\n通道{idx} (t={t}) logits统计:")
-                        print(f"  Mean: {float(jnp.mean(logits_np)):.4f}")
-                        print(f"  Std:  {float(jnp.std(logits_np)):.4f}")
-                        print(f"  Min:  {float(jnp.min(logits_np)):.4f}")
-                        print(f"  Max:  {float(jnp.max(logits_np)):.4f}")
-
-                        # 打印Top-5 logits和对应的token
-                        top5_indices = jnp.argsort(logits_np)[-5:][::-1]
-                        top5_values = logits_np[top5_indices]
-                        print(f"  Top-5 tokens: {[int(i) for i in top5_indices]}")
-                        print(f"  Top-5 logits: {[float(v) for v in top5_values]}")
-
-                        # 计算entropy（diversity指标）
-                        probs = jax.nn.softmax(logits_np)
-                        entropy = -jnp.sum(probs * jnp.log(probs + 1e-10))
-                        print(f"  Entropy: {float(entropy):.4f} (higher = more diverse)")
-
                     # Sample token
                     key, subkey = jax.random.split(key)
                     cur_token = local_sampler.sample(

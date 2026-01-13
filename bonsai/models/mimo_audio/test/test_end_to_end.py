@@ -1047,7 +1047,6 @@ class EndToEndTester:
             # 统计信息（用于诊断）
             num_empty_idx_generated = 0  # 生成了多少个empty_idx（对应音频）
             num_text_token_generated = 0  # 生成了多少个文本token
-            num_other_token_generated = 0  # 其他token
 
             # 创建 sampler（使用官方推荐参数）
             from bonsai.models.mimo_audio.modeling import MiMoSampler, MiMoSamplerConfig
@@ -1069,10 +1068,6 @@ class EndToEndTester:
 
                     # 检查top-k概率
                     probs = jax.nn.softmax(text_logits[0, 0], axis=-1)
-                    top_k_probs, top_k_indices = jax.lax.top_k(probs, 10)
-                    self._print(f"  前10个token概率：")
-                    for i in range(10):
-                        self._print(f"    Token {int(top_k_indices[i])}: {float(top_k_probs[i]):.6f}")
 
                 # 采样下一个文本 token - 修正形状为2D
                 key, subkey = jax.random.split(rng_key)
@@ -1127,30 +1122,6 @@ class EndToEndTester:
                         audio_sampler
                     )  # Returns [B, group_size, audio_channels]
 
-                    # 调试：打印音频tokens统计（每次生成音频时）
-                    self._print(f"\n  步骤 {step + 1}: 文本token是empty_idx，生成音频")
-                    self._print(f"  audio_tokens shape: {audio_tokens.shape}")
-                    self._print(f"  audio_tokens 统计：均值={float(jnp.mean(audio_tokens)):.4f}, "
-                               f"最小值={int(jnp.min(audio_tokens))}, "
-                               f"最大值={int(jnp.max(audio_tokens))}")
-
-                    # 检查每个通道的多样性
-                    for ch in range(audio_channels):
-                        ch_tokens = audio_tokens[0, :, ch]
-                        unique_count = len(jnp.unique(ch_tokens))
-                        if ch < 2:
-                            empty_id = 1024
-                            vocab_size = 1025
-                        else:
-                            empty_id = 128
-                            vocab_size = 129
-
-                        all_empty = jnp.all(ch_tokens == empty_id)
-                        if all_empty:
-                            self._print(f"    通道{ch}: ❌ 全是empty_id ({empty_id})")
-                        else:
-                            self._print(f"    通道{ch}: ✅ 唯一值={unique_count}/{group_size}, tokens={ch_tokens}")
-
                     # ✅ 修复：保存所有 group_size 个时间步（而不是只保存第一个）
                     for t in range(group_size):
                         audio_tokens_step = audio_tokens[0, t, :]  # [audio_channels]
@@ -1173,8 +1144,6 @@ class EndToEndTester:
                         for i in range(group_size):
                             next_input = next_input.at[0, ch + 1, i].set(channel_empty_id)
                 else:
-                    # ✅ 修复：使用所有时间步的 audio tokens
-                    # audio_tokens shape: [B, group_size, audio_channels]
                     for ch in range(audio_channels):
                         for i in range(group_size):
                             next_input = next_input.at[0, ch + 1, i].set(audio_tokens[0, i, ch])
@@ -1204,8 +1173,6 @@ class EndToEndTester:
             self._print(f"  - Empty_idx（对应音频）: {num_empty_idx_generated} 个")
             self._print(f"  - 文本token: {num_text_token_generated} 个")
             self._print(f"  - 总共生成: {len(generated_text_tokens)} 个token")
-
-
 
 
             # 解析文本结果
@@ -1263,27 +1230,15 @@ class EndToEndTester:
                 self._print(f"  Empty时间步: {num_empty}")
 
                 # 可视化哪些位置是真实音频
-                if audio_tokens_array.shape[1] <= 100:
-                    # 如果时间步不太多，显示可视化
-                    viz = ""
-                    for i in range(audio_tokens_array.shape[1]):
-                        if is_real_audio_mask[i]:
-                            viz += "■"  # 真实音频
-                        else:
-                            viz += "□"  # Empty
-                    self._print(f"  时间步可视化: {viz}")
-                    self._print(f"    (■=真实音频  □=empty)")
-                else:
-                    # 只显示前50个和后50个
-                    viz_start = ""
-                    viz_end = ""
-                    for i in range(audio_tokens_array.shape[1]):
-                        if is_real_audio_mask[i]:
-                            viz_start += "■"
-                        else:
-                            viz_start += "□"
+                viz = ""
+                for i in range(audio_tokens_array.shape[1]):
+                    if is_real_audio_mask[i]:
+                        viz += "■"  # 真实音频
+                    else:
+                        viz += "□"  # Empty
+                self._print(f"  时间步可视化: {viz}")
+                self._print(f"    (■=真实音频  □=empty)")
 
-                    self._print(f"    (■=真实音频  □=empty)")
 
                 if num_real_audio == 0:
                     self._print(f"\n⚠️  警告：所有时间步都是empty_id，没有真实音频内容！")
@@ -1313,7 +1268,6 @@ class EndToEndTester:
                     unique_count = len(unique_vals)
 
                     empty_id = speech_empty_ids[ch]
-                    non_empty_count = jnp.sum(ch_tokens != empty_id)
 
                     self._print(f"  通道{ch}: 最小={int(ch_tokens.min())}, "
                                f"最大={int(ch_tokens.max())}, "
@@ -1333,12 +1287,6 @@ class EndToEndTester:
                     else:
                         self._print(f"    ✅ 有足够多样性")
 
-                if not all_channels_good:
-                    self._print(f"\n⚠️ 警告：音频tokens质量不佳，可能导致音质差")
-                    self._print(f"可能原因：")
-                    self._print(f"  1. local_forward采样参数不当（temperature太低/太高）")
-                    self._print(f"  2. local_transformer权重未正确加载")
-                    self._print(f"  3. local_forward的cache或逻辑有问题")
 
                 decoded_audio = self.tokenizer_model.decode(codes_for_decoder)
                 self._print(f"解码后音频形状: {decoded_audio.shape}")
