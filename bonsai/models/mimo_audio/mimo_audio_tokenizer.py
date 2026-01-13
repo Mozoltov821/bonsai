@@ -203,23 +203,6 @@ class RotaryEmbedding(nnx.Module):
         return cos.astype(hidden_states.dtype), sin.astype(hidden_states.dtype)
 
 
-def Conv1d(in_channels: int, out_channels: int, kernel_size: int, stride: int = 1,
-           padding: str = "SAME", use_bias: bool = True, dtype=jnp.float32, rngs: Optional[nnx.Rngs] = None):
-    """Wrapper around nnx.Conv for 1D convolution with zero initialization."""
-    return nnx.Conv(
-        in_features=in_channels,
-        out_features=out_channels,
-        kernel_size=kernel_size,
-        strides=stride,
-        padding=padding,
-        use_bias=use_bias,
-        param_dtype=dtype,
-        kernel_init=nnx.initializers.zeros_init(),
-        bias_init=nnx.initializers.zeros_init(),
-        rngs=rngs
-    )
-
-
 class ConvTranspose1d(nnx.Module):
     """Custom 1D transposed convolution for specific audio processing requirements."""
 
@@ -455,10 +438,23 @@ class ResidualVectorQuantizer(nnx.Module):
 class AudioEncoder(nnx.Module):
     def __init__(self, config: MiMoAudioTokenizerConfig, dtype=jnp.float32, rngs: Optional[nnx.Rngs] = None):
         self.config = config
-        self.conv1 = Conv1d(config.n_mels, config.d_model, kernel_size=config.kernel_size, padding="SAME", dtype=dtype,
-                            rngs=rngs)
-        self.conv2 = Conv1d(config.d_model, config.d_model, kernel_size=config.kernel_size, stride=config.stride_size,
-                            padding="SAME", dtype=dtype, rngs=rngs)
+        self.conv1 = nnx.Conv(
+            in_features=config.n_mels,
+            out_features=config.d_model,
+            kernel_size=config.kernel_size,
+            padding="SAME",
+            param_dtype=dtype,
+            rngs=rngs
+        )
+        self.conv2 = nnx.Conv(
+            in_features=config.d_model,
+            out_features=config.d_model,
+            kernel_size=config.kernel_size,
+            strides=config.stride_size,
+            padding="SAME",
+            param_dtype=dtype,
+            rngs=rngs
+        )
         self.position_embedding = RotaryEmbedding(config.rope_theta, config.d_model // config.encoder_attention_heads,
                                                   config.max_audio_seconds * config.sampling_rate // config.hop_length,
                                                   config.rope_type, dtype=dtype)
@@ -471,9 +467,16 @@ class AudioEncoder(nnx.Module):
         ])
         self.layer_norm = build_norm(config.ln_type, config.d_model, dtype, rngs)
         if config.avg_pooler != 1:
-            self.down_sample_layer = Conv1d(config.d_model, config.d_model, kernel_size=config.avg_pooler,
-                                            stride=config.avg_pooler, padding="SAME", use_bias=False, dtype=dtype,
-                                            rngs=rngs)
+            self.down_sample_layer = nnx.Conv(
+                in_features=config.d_model,
+                out_features=config.d_model,
+                kernel_size=config.avg_pooler,
+                strides=config.avg_pooler,
+                padding="SAME",
+                use_bias=False,
+                param_dtype=dtype,
+                rngs=rngs
+            )
             self.down_norm = build_norm(config.ln_type, config.d_model, dtype, rngs)
         else:
             self.down_sample_layer = None
