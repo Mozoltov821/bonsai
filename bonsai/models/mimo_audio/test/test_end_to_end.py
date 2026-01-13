@@ -332,27 +332,20 @@ class EndToEndTester:
             self._print(f"  - 重建长度: {recon_len} 采样点 ({recon_len/sample_rate:.2f}s)")
             self._print(f"  - 长度比率: {recon_len / original_len:.2f}x")
 
-            # Save audio files
-            try:
-                import soundfile as sf
-                output_dir = "test_outputs"
-                os.makedirs(output_dir, exist_ok=True)
 
-                # Save original audio
-                original_path = os.path.join(output_dir, "original_audio.wav")
-                sf.write(original_path, np.array(original_waveform), sample_rate)
-                self._print(f"  - 已保存原始音频: {original_path}")
+            import soundfile as sf
+            output_dir = "test_outputs"
+            os.makedirs(output_dir, exist_ok=True)
 
-                # Save reconstructed audio
-                reconstructed_path = os.path.join(output_dir, "reconstructed_audio.wav")
-                reconstructed_np = np.array(reconstructed_audio[0, 0, :])
-                sf.write(reconstructed_path, reconstructed_np, sample_rate)
-                self._print(f"  - 已保存重建音频: {reconstructed_path}")
+            # Save original audio
+            original_path = os.path.join(output_dir, "original_audio.wav")
+            sf.write(original_path, np.array(original_waveform), sample_rate)
+            self._print(f"  - 已保存原始音频: {original_path}")
 
-            except ImportError:
-                self._print("  - soundfile 不可用，跳过音频保存", "WARNING")
-            except Exception as e:
-                self._print(f"  - 保存失败 audio: {e}", "WARNING")
+            # Save reconstructed audio
+            reconstructed_path = os.path.join(output_dir, "reconstructed_audio.wav")
+            reconstructed_np = np.array(reconstructed_audio[0, 0, :])
+            sf.write(reconstructed_path, reconstructed_np, sample_rate)
 
             self.test_results["audio_reconstruction"] = {
                 "success": True,
@@ -954,9 +947,9 @@ class EndToEndTester:
 
             # 文本通道：使用TTS prompt格式（关键！）
             if text_tokenizer:
-                # ✅ 关键修复：使用简短的prompt确保SOSTM不被截断
-                text_to_speak = "窗前明月光，疑是地上霜，举头望明月，低头思故乡。"  # 使用简短文本
-                tts_template = "请将这段文字转换为语音"
+                # text_to_speak = "床前明月光，疑是地上霜，举头望明月，低头思故乡。"  # 使用简短文本
+                text_to_speak = "在那边，在大海的那一头，老人正睡在自己的棚子里。他依然脸朝下睡着，孩子坐在他身边守着他。老人正梦见狮子。一个人并不是生来要给打败的。你尽可以把他消灭掉，可就是打不败他。"
+                tts_template = "请将这段文字转换为语音，使用沉稳的男性音色，富有力量感"
 
                 # 官方TTS格式：
                 # <|im_start|>user\n{template}: {text}<|im_end|>\n<|im_start|>assistant\n<|sostm|>
@@ -1051,13 +1044,15 @@ class EndToEndTester:
             generated_text_tokens = []
             generated_audio_tokens_list = []
 
-            # 创建 sampler（使用更保守的参数以提高质量）
+            # 统计信息（用于诊断）
+            num_empty_idx_generated = 0  # 生成了多少个empty_idx（对应音频）
+            num_text_token_generated = 0  # 生成了多少个文本token
+            num_other_token_generated = 0  # 其他token
+
+            # 创建 sampler（使用官方推荐参数）
             from bonsai.models.mimo_audio.modeling import MiMoSampler, MiMoSamplerConfig
-            # ✅ 提高temperature让logits分布更平滑，避免过度集中
-            # Entropy分析显示通道1-4的logits极度集中(entropy<2.0)
-            # 使用temperature>1.0来flatten分布，增加diversity
             text_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.6, top_k=50, top_p=1.0, do_sample=True))
-            audio_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.9, top_k=50, top_p=0.95, do_sample=True))  # 从0.9提高到1.5
+            audio_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.9, top_k=50, top_p=0.95, do_sample=True))
 
             # Random key for sampling
             rng_key = jax.random.key(42)
@@ -1085,6 +1080,16 @@ class EndToEndTester:
                 next_text_token = text_sampler.sample(logits_2d, subkey)
                 next_text_token_int = int(next_text_token[0])
                 generated_text_tokens.append(next_text_token_int)
+
+                # 统计token类型
+                empty_idx = self.main_model.args.empty_idx
+                if next_text_token_int == empty_idx:
+                    num_empty_idx_generated += 1
+                elif next_text_token_int == self.main_model.args.eostm_idx or \
+                     (text_tokenizer and next_text_token_int == text_tokenizer.eos_token_id):
+                    pass  # 停止token，不计数
+                else:
+                    num_text_token_generated += 1
 
                 # 检查是否生成了停止token（EOSTM或EOS）
                 if next_text_token_int == self.main_model.args.eostm_idx:
@@ -1191,6 +1196,18 @@ class EndToEndTester:
             inference_time = time.time() - start_time
             self._print(f"\n推理完成，总耗时: {inference_time:.3f}秒")
 
+            # 统计报告
+            self._print("\n" + "=" * 70)
+            self._print("生成统计")
+            self._print("=" * 70)
+            self._print(f"生成的token类型分布:")
+            self._print(f"  - Empty_idx（对应音频）: {num_empty_idx_generated} 个")
+            self._print(f"  - 文本token: {num_text_token_generated} 个")
+            self._print(f"  - 总共生成: {len(generated_text_tokens)} 个token")
+
+
+
+
             # 解析文本结果
             self._print("\n" + "=" * 70)
             self._print("生成结果")
@@ -1218,9 +1235,64 @@ class EndToEndTester:
                 audio_tokens_array = jnp.stack(generated_audio_tokens_list, axis=0)  # [time, channels]
                 audio_tokens_array = audio_tokens_array.T  # [channels, time]
 
-                self._print(f"音频 tokens 形状: {audio_tokens_array.shape}")
+                self._print(f"原始音频 tokens 形状: {audio_tokens_array.shape}")
                 self._print(f"  - 通道数: {audio_tokens_array.shape[0]}")
                 self._print(f"  - 时间步: {audio_tokens_array.shape[1]}")
+
+                # ✅ 关键修复：过滤掉所有的empty_id时间步（不仅是前面，中间也可能有）
+                # 只保留真正生成音频的时间步
+                speech_empty_ids = self.main_model.speech_empty_ids
+
+                # 标记每个时间步是否为真实音频
+                # 真实音频 = 至少有一个通道不是empty_id
+                is_real_audio_mask = jnp.zeros(audio_tokens_array.shape[1], dtype=bool)
+
+                for ch in range(audio_channels):
+                    empty_id = speech_empty_ids[ch]
+                    # 这个通道不是empty的时间步
+                    not_empty = audio_tokens_array[ch, :] != empty_id
+                    is_real_audio_mask = is_real_audio_mask | not_empty
+
+                # 统计有多少时间步是真实音频
+                num_real_audio = int(jnp.sum(is_real_audio_mask))
+                num_empty = audio_tokens_array.shape[1] - num_real_audio
+
+                self._print(f"\n音频tokens分析:")
+                self._print(f"  总时间步: {audio_tokens_array.shape[1]}")
+                self._print(f"  真实音频时间步: {num_real_audio}")
+                self._print(f"  Empty时间步: {num_empty}")
+
+                # 可视化哪些位置是真实音频
+                if audio_tokens_array.shape[1] <= 100:
+                    # 如果时间步不太多，显示可视化
+                    viz = ""
+                    for i in range(audio_tokens_array.shape[1]):
+                        if is_real_audio_mask[i]:
+                            viz += "■"  # 真实音频
+                        else:
+                            viz += "□"  # Empty
+                    self._print(f"  时间步可视化: {viz}")
+                    self._print(f"    (■=真实音频  □=empty)")
+                else:
+                    # 只显示前50个和后50个
+                    viz_start = ""
+                    viz_end = ""
+                    for i in range(audio_tokens_array.shape[1]):
+                        if is_real_audio_mask[i]:
+                            viz_start += "■"
+                        else:
+                            viz_start += "□"
+
+                    self._print(f"    (■=真实音频  □=empty)")
+
+                if num_real_audio == 0:
+                    self._print(f"\n⚠️  警告：所有时间步都是empty_id，没有真实音频内容！")
+                else:
+                    # 只保留真实音频的时间步
+                    audio_tokens_array = audio_tokens_array[:, is_real_audio_mask]
+
+                    self._print(f"✅ 过滤后只保留真实音频部分")
+                    self._print(f"   过滤后 tokens 形状: {audio_tokens_array.shape}")
 
                 # ✅ 关键修复：与官方实现一致，直接使用8个通道的codes
                 # 官方代码：codes = tokens.reshape(-1, self.audio_channels).T  # [audio_channels, time]
