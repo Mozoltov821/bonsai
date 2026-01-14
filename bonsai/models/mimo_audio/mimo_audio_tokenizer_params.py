@@ -151,6 +151,7 @@ def _assign_weights(
     tensor: Any,
     state_dict: dict,
     transform: Transform | None,
+    sharding_dict: dict | None = None,
 ) -> None:
     key, *rest = keys
     if not rest:
@@ -166,9 +167,14 @@ def _assign_weights(
             raise ValueError(f"Shape mismatch: {tensor.shape} vs {state_dict[key].shape}")
 
         target_dtype = state_dict[key].dtype
-        state_dict[key] = jax.device_put(jnp.asarray(tensor, dtype=target_dtype))
+        # Apply sharding if available
+        if sharding_dict is not None:
+            state_dict[key] = jax.device_put(jnp.asarray(tensor, dtype=target_dtype), sharding_dict[key])
+        else:
+            state_dict[key] = jax.device_put(jnp.asarray(tensor, dtype=target_dtype))
     else:
-        _assign_weights(rest, tensor, state_dict[key], transform)
+        next_sharding = sharding_dict[key] if sharding_dict is not None else None
+        _assign_weights(rest, tensor, state_dict[key], transform, next_sharding)
 
 
 def _stoi(s: str) -> str | int:
@@ -182,12 +188,16 @@ def load_tokenizer_weights_from_safetensors(
     config: model_lib.MiMoAudioTokenizerConfig,
     safetensors_path: str,
     dtype=jnp.float32,
+    mesh: jax.sharding.Mesh | None = None,
     rngs: nnx.Rngs | None = None,
 ) -> model_lib.FlaxMiMoAudioTokenizer:
 
     model = nnx.eval_shape(lambda: model_lib.FlaxMiMoAudioTokenizer(config, dtype=dtype, rngs=nnx.Rngs(params=0)))
     graph_def, abs_state = nnx.split(model)
     state_dict = abs_state.to_pure_dict()
+
+    # Get sharding information if mesh is provided
+    sharding = nnx.get_named_sharding(abs_state, mesh).to_pure_dict() if mesh is not None else None
 
     key_mapping = _get_key_mapping(config)
     conversion_errors = []
@@ -203,7 +213,8 @@ def load_tokenizer_weights_from_safetensors(
             keys = [_stoi(k) for k in jax_key.split(".")]
             try:
                 tensor = sf.get_tensor(torch_key)
-                _assign_weights(keys, tensor, state_dict, transform)
+                # Pass sharding information to _assign_weights
+                _assign_weights(keys, tensor, state_dict, transform, sharding)
             except Exception as e:
                 conversion_errors.append(f"Failed to assign '{torch_key}' to '{jax_key}': {type(e).__name__}: {e}")
 

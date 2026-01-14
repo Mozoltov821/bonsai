@@ -5,8 +5,110 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from transformers import PretrainedConfig
+from jax.sharding import PartitionSpec as P, get_abstract_mesh, reshard
 
 Array = jnp.ndarray
+ShardingSpec = P
+
+
+def shard(x: Array, s: ShardingSpec) -> Array:
+    """Apply sharding to array if mesh is available."""
+    mesh = get_abstract_mesh()
+    if not mesh.empty and len(mesh.axis_names) > 0:
+        return reshard(x, s)
+    return x
+
+
+@dataclass(slots=True, frozen=True)
+class MiMoShardingCfg:
+    """Sharding configuration for MiMo Audio Tokenizer.
+
+    Controls how model parameters and activations are distributed across devices.
+    """
+    # Conv层权重 sharding
+    conv_weight: ShardingSpec  # (in_channels, out_channels, kernel_size)
+    conv_bias: ShardingSpec    # (out_channels,)
+
+    # Transformer权重 sharding (Encoder/Decoder/Vocoder共用)
+    attn_qkvo_weight: ShardingSpec  # (d_model, d_model)
+    attn_qkv_bias: ShardingSpec     # (d_model,)
+    attn_out_bias: ShardingSpec     # (d_model,)
+
+    # FFN权重 sharding
+    ffn_weight_in: ShardingSpec   # (d_model, ffn_dim)
+    ffn_weight_out: ShardingSpec  # (ffn_dim, d_model)
+    ffn_bias: ShardingSpec        # (ffn_dim,) or (d_model,)
+
+    # LayerNorm/GroupNorm sharding
+    norm_scale: ShardingSpec      # (dim,)
+    norm_bias: ShardingSpec       # (dim,)
+
+    # Quantizer codebook sharding
+    codebook: ShardingSpec        # (codebook_size, d_model)
+
+    # ConvTranspose1d权重 sharding
+    conv_transpose_weight: ShardingSpec  # (in_ch, out_ch, kernel)
+    conv_transpose_bias: ShardingSpec    # (out_ch,)
+
+    # ISTFT相关 sharding
+    istft_linear_weight: ShardingSpec  # (dim, n_fft+2)
+    istft_linear_bias: ShardingSpec    # (n_fft+2,)
+    istft_window: ShardingSpec         # (win_length,)
+
+    # 激活值 sharding
+    act_btd: ShardingSpec         # [batch, time, d_model]
+    act_btnh: ShardingSpec        # [batch, time, num_heads, head_dim]
+    act_btc: ShardingSpec         # [batch, time, channels]
+
+    @staticmethod
+    def no_sharding():
+        """Configuration with no sharding (all None)."""
+        return MiMoShardingCfg(
+            conv_weight=P(None, None, None),
+            conv_bias=P(None),
+            attn_qkvo_weight=P(None, None),
+            attn_qkv_bias=P(None),
+            attn_out_bias=P(None),
+            ffn_weight_in=P(None, None),
+            ffn_weight_out=P(None, None),
+            ffn_bias=P(None),
+            norm_scale=P(None),
+            norm_bias=P(None),
+            codebook=P(None, None),
+            conv_transpose_weight=P(None, None, None),
+            conv_transpose_bias=P(None),
+            istft_linear_weight=P(None, None),
+            istft_linear_bias=P(None),
+            istft_window=P(None),
+            act_btd=P(None, None, None),
+            act_btnh=P(None, None, None, None),
+            act_btc=P(None, None, None),
+        )
+
+    @staticmethod
+    def default():
+        """Default sharding configuration for distributed training."""
+        return MiMoShardingCfg(
+            conv_weight=P(None, "tp", None),
+            conv_bias=P("tp"),
+            attn_qkvo_weight=P("fsdp", "tp"),
+            attn_qkv_bias=P("tp"),
+            attn_out_bias=P("tp"),
+            ffn_weight_in=P("fsdp", "tp"),
+            ffn_weight_out=P("tp", "fsdp"),
+            ffn_bias=P("tp"),
+            norm_scale=P("tp"),
+            norm_bias=P("tp"),
+            codebook=P("tp", "fsdp"),
+            conv_transpose_weight=P(None, "tp", None),
+            conv_transpose_bias=P("tp"),
+            istft_linear_weight=P("fsdp", "tp"),
+            istft_linear_bias=P("tp"),
+            istft_window=P(None),  # replicated
+            act_btd=P("fsdp", None, "tp"),
+            act_btnh=P("fsdp", None, "tp", None),
+            act_btc=P("fsdp", None, "tp"),
+        )
 
 
 class MiMoAudioTokenizerConfig(PretrainedConfig):
@@ -55,6 +157,8 @@ class MiMoAudioTokenizerConfig(PretrainedConfig):
             ln_type: str = "LayerNorm",
             vocoder_attention_heads: int = 16,
             vocoder_attn_window_size: list[int] = None,  # [40,10]
+            use_sharding: bool = False,  # 新增
+            shd_cfg: MiMoShardingCfg | None = None,  # 新增
             **kwargs,
     ):
         super().__init__(**kwargs)
@@ -111,18 +215,11 @@ class MiMoAudioTokenizerConfig(PretrainedConfig):
             else [40, 10]
         )
 
-
-def _default_activation(name: str) -> Callable[[Array], Array]:
-    name = name.lower()
-    if name == "relu":
-        return jax.nn.relu
-    if name in ("gelu", "gelu_new"):
-        return jax.nn.gelu
-    if name in ("silu", "swish"):
-        return jax.nn.silu
-    if name == "tanh":
-        return jnp.tanh
-    raise ValueError(f"Unsupported activation {name}")
+        # Sharding configuration
+        if shd_cfg is None:
+            self.shd_cfg = MiMoShardingCfg.default() if use_sharding else MiMoShardingCfg.no_sharding()
+        else:
+            self.shd_cfg = shd_cfg
 
 
 def make_sequence_mask(lengths: Array, max_length: Optional[int] = None) -> Array:
@@ -208,12 +305,18 @@ class ConvTranspose1d(nnx.Module):
     """Custom 1D transposed convolution for specific audio processing requirements."""
 
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int,
+                 shd_cfg: MiMoShardingCfg | None = None,
                  dtype=jnp.float32, rngs: Optional[nnx.Rngs] = None):
         self.stride = stride
+        self.shd_cfg = shd_cfg or MiMoShardingCfg.no_sharding()
+
+        # Create and shard kernel and bias
         kshape = (in_channels, out_channels, kernel_size)
         kernel = jnp.zeros(kshape, dtype=dtype)
-        self.kernel = nnx.Param(kernel)
-        self.bias = nnx.Param(jnp.zeros((out_channels,), dtype=dtype))
+        self.kernel = shard(nnx.Param(kernel), self.shd_cfg.conv_transpose_weight)
+
+        bias = jnp.zeros((out_channels,), dtype=dtype)
+        self.bias = shard(nnx.Param(bias), self.shd_cfg.conv_transpose_bias)
 
     def __call__(self, x: Array) -> Array:
         batch, length, channels = x.shape
@@ -239,12 +342,20 @@ class ConvTranspose1d(nnx.Module):
 
 
 class ISTFT(nnx.Module):
-    def __init__(self, n_fft: int, hop_length: int, win_length: int, padding: str = "same", dtype=jnp.float32):
+    def __init__(self, n_fft: int, hop_length: int, win_length: int, padding: str = "same",
+                 shd_cfg: MiMoShardingCfg | None = None, dtype=jnp.float32):
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.win_length = win_length
         self.padding = padding
-        self.window = nnx.Param(jnp.hanning(win_length).astype(dtype))
+        self.shd_cfg = shd_cfg or MiMoShardingCfg.no_sharding()
+
+        # Apply sharding to window parameter (usually replicated)
+        self.window = shard(
+            nnx.Param(jnp.hanning(win_length).astype(dtype)),
+            self.shd_cfg.istft_window
+        )
+
         self.pad = (self.win_length - self.hop_length) // 2 if padding == "same" else 0
 
     def __call__(self, spec: Array) -> Array:
@@ -288,10 +399,20 @@ class ISTFT(nnx.Module):
 
 
 class ISTFTHead(nnx.Module):
-    def __init__(self, dim: int, n_fft: int, hop_length: int, padding: str = "same", dtype=jnp.float32,
-                 rngs: Optional[nnx.Rngs] = None):
-        self.linear = nnx.Linear(dim, n_fft + 2, dtype=dtype, rngs=rngs)
-        self.istft = ISTFT(n_fft=n_fft, hop_length=hop_length, win_length=n_fft, padding=padding, dtype=dtype)
+    def __init__(self, dim: int, n_fft: int, hop_length: int, padding: str = "same",
+                 shd_cfg: MiMoShardingCfg | None = None,
+                 dtype=jnp.float32, rngs: Optional[nnx.Rngs] = None):
+        self.shd_cfg = shd_cfg or MiMoShardingCfg.no_sharding()
+
+        # Apply sharding to Linear layer
+        self.linear = shard(
+            nnx.Linear(dim, n_fft + 2, dtype=dtype, rngs=rngs),
+            self.shd_cfg.istft_linear_weight
+        )
+
+        # Pass shd_cfg to ISTFT
+        self.istft = ISTFT(n_fft=n_fft, hop_length=hop_length, win_length=n_fft,
+                          padding=padding, shd_cfg=self.shd_cfg, dtype=dtype)
 
     def __call__(self, hidden_states: Array) -> Array:
         x = self.linear(hidden_states)
@@ -313,7 +434,8 @@ class ISTFTHead(nnx.Module):
 
 
 class Attention(nnx.Module):
-    def __init__(self, embed_dim: int, num_heads: int, window_size: Tuple[int, int], causal: bool, dtype=jnp.float32,
+    def __init__(self, embed_dim: int, num_heads: int, window_size: Tuple[int, int], causal: bool,
+                 shd_cfg: MiMoShardingCfg, dtype=jnp.float32,
                  rngs: Optional[nnx.Rngs] = None):
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -321,10 +443,25 @@ class Attention(nnx.Module):
         self.scale = 1.0 / math.sqrt(self.head_dim)
         self.window_size = window_size
         self.causal = causal
-        self.q_proj = nnx.Linear(embed_dim, embed_dim, use_bias=True, dtype=dtype, rngs=rngs)
-        self.k_proj = nnx.Linear(embed_dim, embed_dim, use_bias=False, dtype=dtype, rngs=rngs)
-        self.v_proj = nnx.Linear(embed_dim, embed_dim, use_bias=True, dtype=dtype, rngs=rngs)
-        self.out_proj = nnx.Linear(embed_dim, embed_dim, dtype=dtype, rngs=rngs)
+        self.shd_cfg = shd_cfg
+
+        # Apply sharding to Linear layers
+        self.q_proj = shard(
+            nnx.Linear(embed_dim, embed_dim, use_bias=True, dtype=dtype, rngs=rngs),
+            shd_cfg.attn_qkvo_weight
+        )
+        self.k_proj = shard(
+            nnx.Linear(embed_dim, embed_dim, use_bias=False, dtype=dtype, rngs=rngs),
+            shd_cfg.attn_qkvo_weight
+        )
+        self.v_proj = shard(
+            nnx.Linear(embed_dim, embed_dim, use_bias=True, dtype=dtype, rngs=rngs),
+            shd_cfg.attn_qkvo_weight
+        )
+        self.out_proj = shard(
+            nnx.Linear(embed_dim, embed_dim, dtype=dtype, rngs=rngs),
+            shd_cfg.attn_qkvo_weight
+        )
 
     def _window_mask(self, seq_len: int) -> Optional[Array]:
         left, right = self.window_size
@@ -350,6 +487,12 @@ class Attention(nnx.Module):
             return jnp.swapaxes(t, 1, 2)
 
         q, k, v = reshape(q), reshape(k), reshape(v)
+
+        # Apply sharding to activations after reshape
+        q = shard(q, self.shd_cfg.act_btnh)
+        k = shard(k, self.shd_cfg.act_btnh)
+        v = shard(v, self.shd_cfg.act_btnh)
+
         if rope is not None:
             cos, sin = rope
             q = apply_rotary(q, cos, sin)
@@ -369,18 +512,42 @@ class Attention(nnx.Module):
         out = self.out_proj(context)
         if mask is not None:
             out = out * mask[..., None]
+
+        # Apply sharding to output
+        out = shard(out, self.shd_cfg.act_btd)
         return out
 
 
 class TransformerLayer(nnx.Module):
     def __init__(self, d_model: int, attention_heads: int, ffn_dim: int, causal: bool,
-                 attn_window_size: Tuple[int, int], dtype=jnp.float32, rngs: Optional[nnx.Rngs] = None):
+                 attn_window_size: Tuple[int, int], shd_cfg: MiMoShardingCfg, dtype=jnp.float32,
+                 rngs: Optional[nnx.Rngs] = None):
         self.act = jax.nn.gelu
-        self.self_attn = Attention(d_model, attention_heads, attn_window_size, causal, dtype=dtype, rngs=rngs)
-        self.self_attn_layer_norm = nnx.LayerNorm(d_model, epsilon=1e-6, param_dtype=dtype, rngs=rngs)
-        self.final_layer_norm = nnx.LayerNorm(d_model, epsilon=1e-6, param_dtype=dtype, rngs=rngs)
-        self.fc1 = nnx.Linear(d_model, ffn_dim, dtype=dtype, rngs=rngs)
-        self.fc2 = nnx.Linear(ffn_dim, d_model, dtype=dtype, rngs=rngs)
+        self.shd_cfg = shd_cfg
+
+        # Pass shd_cfg to Attention
+        self.self_attn = Attention(d_model, attention_heads, attn_window_size, causal,
+                                   shd_cfg, dtype=dtype, rngs=rngs)
+
+        # Apply sharding to LayerNorm layers
+        self.self_attn_layer_norm = shard(
+            nnx.LayerNorm(d_model, epsilon=1e-6, param_dtype=dtype, rngs=rngs),
+            shd_cfg.norm_scale
+        )
+        self.final_layer_norm = shard(
+            nnx.LayerNorm(d_model, epsilon=1e-6, param_dtype=dtype, rngs=rngs),
+            shd_cfg.norm_scale
+        )
+
+        # Apply sharding to FFN layers
+        self.fc1 = shard(
+            nnx.Linear(d_model, ffn_dim, dtype=dtype, rngs=rngs),
+            shd_cfg.ffn_weight_in
+        )
+        self.fc2 = shard(
+            nnx.Linear(ffn_dim, d_model, dtype=dtype, rngs=rngs),
+            shd_cfg.ffn_weight_out
+        )
 
     def __call__(self, hidden_states: Array, mask: Optional[Array], rope: Optional[Tuple[Array, Array]]) -> Array:
         residual = hidden_states
@@ -391,20 +558,27 @@ class TransformerLayer(nnx.Module):
         hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = self.fc1(hidden_states)
         hidden_states = self.act(hidden_states)
+        # Apply sharding to activation after fc1
+        hidden_states = shard(hidden_states, self.shd_cfg.act_btd)
         hidden_states = self.fc2(hidden_states)
         return residual + hidden_states
 
 
 class ResidualVectorQuantizer(nnx.Module):
-    def __init__(self, dimension: int, n_q: int, bins: Sequence[int], dtype=jnp.float32,
+    def __init__(self, dimension: int, n_q: int, bins: Sequence[int],
+                 shd_cfg: MiMoShardingCfg, dtype=jnp.float32,
                  rngs: Optional[nnx.Rngs] = None):
         self.dimension = dimension
         self.n_q = n_q
+        self.shd_cfg = shd_cfg
+
+        # Create codebooks with sharding applied
         codebooks_list = []
         for i in range(n_q):
             size = bins[min(i, len(bins) - 1)]
             embed = jnp.zeros((size, dimension), dtype=dtype)
-            codebooks_list.append(nnx.Param(embed))
+            # Apply sharding to each codebook
+            codebooks_list.append(shard(nnx.Param(embed), shd_cfg.codebook))
         self.codebooks = nnx.List(codebooks_list)
 
     def encode(self, hidden_states: Array, mask: Optional[Array] = None, n_q: Optional[int] = None) -> Tuple[
@@ -439,54 +613,80 @@ class ResidualVectorQuantizer(nnx.Module):
 class AudioEncoder(nnx.Module):
     def __init__(self, config: MiMoAudioTokenizerConfig, dtype=jnp.float32, rngs: Optional[nnx.Rngs] = None):
         self.config = config
-        self.conv1 = nnx.Conv(
-            in_features=config.n_mels,
-            out_features=config.d_model,
-            kernel_size=config.kernel_size,
-            padding="SAME",
-            param_dtype=dtype,
-            rngs=rngs
+        self.shd_cfg = config.shd_cfg
+
+        # Apply sharding to Conv layers
+        self.conv1 = shard(
+            nnx.Conv(
+                in_features=config.n_mels,
+                out_features=config.d_model,
+                kernel_size=config.kernel_size,
+                padding="SAME",
+                param_dtype=dtype,
+                rngs=rngs
+            ),
+            self.shd_cfg.conv_weight
         )
-        self.conv2 = nnx.Conv(
-            in_features=config.d_model,
-            out_features=config.d_model,
-            kernel_size=config.kernel_size,
-            strides=config.stride_size,
-            padding="SAME",
-            param_dtype=dtype,
-            rngs=rngs
+        self.conv2 = shard(
+            nnx.Conv(
+                in_features=config.d_model,
+                out_features=config.d_model,
+                kernel_size=config.kernel_size,
+                strides=config.stride_size,
+                padding="SAME",
+                param_dtype=dtype,
+                rngs=rngs
+            ),
+            self.shd_cfg.conv_weight
         )
+
+        # RotaryEmbedding doesn't need sharding (only inv_freq parameter, very small)
         self.position_embedding = RotaryEmbedding(config.rope_theta, config.d_model // config.encoder_attention_heads,
                                                   config.max_audio_seconds * config.sampling_rate // config.hop_length,
                                                   config.rope_type, dtype=dtype)
 
+        # Pass shd_cfg to TransformerLayers
         self.layers = nnx.List([
             TransformerLayer(config.d_model, config.encoder_attention_heads, config.encoder_ffn_dim,
-                             config.encoder_causal, tuple(config.encoder_attn_window_size), dtype=dtype,
-                             rngs=rngs)
+                             config.encoder_causal, tuple(config.encoder_attn_window_size),
+                             self.shd_cfg, dtype=dtype, rngs=rngs)
             for _ in range(config.encoder_layers)
         ])
 
-        self.layer_norm = build_norm(config.ln_type, config.d_model, dtype, rngs)
+        # Apply sharding to LayerNorm
+        self.layer_norm = shard(
+            build_norm(config.ln_type, config.d_model, dtype, rngs),
+            self.shd_cfg.norm_scale
+        )
+
         if config.avg_pooler != 1:
-            self.down_sample_layer = nnx.Conv(
-                in_features=config.d_model,
-                out_features=config.d_model,
-                kernel_size=config.avg_pooler,
-                strides=config.avg_pooler,
-                padding="SAME",
-                use_bias=False,
-                param_dtype=dtype,
-                rngs=rngs
+            # Apply sharding to down-sample Conv layer
+            self.down_sample_layer = shard(
+                nnx.Conv(
+                    in_features=config.d_model,
+                    out_features=config.d_model,
+                    kernel_size=config.avg_pooler,
+                    strides=config.avg_pooler,
+                    padding="SAME",
+                    use_bias=False,
+                    param_dtype=dtype,
+                    rngs=rngs
+                ),
+                self.shd_cfg.conv_weight
             )
-            self.down_norm = build_norm(config.ln_type, config.d_model, dtype, rngs)
+            self.down_norm = shard(
+                build_norm(config.ln_type, config.d_model, dtype, rngs),
+                self.shd_cfg.norm_scale
+            )
         else:
             self.down_sample_layer = None
             self.down_norm = None
+
         if config.num_quantizers:
             bins = config.codebook_size or [1024]
-            self.quantizer = ResidualVectorQuantizer(config.d_model, config.num_quantizers, bins, dtype=dtype,
-                                                     rngs=rngs)
+            # Pass shd_cfg to ResidualVectorQuantizer
+            self.quantizer = ResidualVectorQuantizer(config.d_model, config.num_quantizers, bins,
+                                                     self.shd_cfg, dtype=dtype, rngs=rngs)
         else:
             self.quantizer = None
 
@@ -498,7 +698,13 @@ class AudioEncoder(nnx.Module):
                  n_q: Optional[int] = None) -> EncoderOutput:
         x = input_features
         x = jax.nn.gelu(self.conv1(x))
+        # Apply sharding to activation after conv1
+        x = shard(x, self.shd_cfg.act_btd)
+
         x = jax.nn.gelu(self.conv2(x))
+        # Apply sharding to activation after conv2
+        x = shard(x, self.shd_cfg.act_btd)
+
         lengths = self.get_output_length(input_lens)
         max_len = x.shape[1]
         mask = make_sequence_mask(lengths, max_len)
@@ -513,6 +719,9 @@ class AudioEncoder(nnx.Module):
         x = self.layer_norm(x)
         if self.down_sample_layer is not None:
             x = jax.nn.gelu(self.down_sample_layer(x))
+            # Apply sharding to activation after down_sample
+            x = shard(x, self.shd_cfg.act_btd)
+
             lengths = (lengths // self.config.avg_pooler) + ((lengths % self.config.avg_pooler) != 0).astype(
                 lengths.dtype)
             max_len = x.shape[1]
@@ -535,10 +744,22 @@ class AudioEncoder(nnx.Module):
 
 
 class CausalConvTranspose1d(nnx.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int, dtype=jnp.float32,
-                 rngs: Optional[nnx.Rngs] = None):
-        self.conv = ConvTranspose1d(in_channels, out_channels, kernel_size, stride, dtype=dtype, rngs=rngs)
-        self.norm = nnx.GroupNorm(num_features=out_channels, num_groups=1, epsilon=1e-5, param_dtype=dtype, rngs=rngs)
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int,
+                 shd_cfg: MiMoShardingCfg | None = None,
+                 dtype=jnp.float32, rngs: Optional[nnx.Rngs] = None):
+        self.shd_cfg = shd_cfg or MiMoShardingCfg.no_sharding()
+
+        # Pass shd_cfg to ConvTranspose1d
+        self.conv = ConvTranspose1d(in_channels, out_channels, kernel_size, stride,
+                                   shd_cfg=self.shd_cfg, dtype=dtype, rngs=rngs)
+
+        # Apply sharding to GroupNorm
+        self.norm = shard(
+            nnx.GroupNorm(num_features=out_channels, num_groups=1, epsilon=1e-5,
+                         param_dtype=dtype, rngs=rngs),
+            self.shd_cfg.norm_scale
+        )
+
         self.kernel_size = kernel_size
         self.stride = stride
 
@@ -555,21 +776,38 @@ class CausalConvTranspose1d(nnx.Module):
 class TransformerVocos(nnx.Module):
     def __init__(self, config: MiMoAudioTokenizerConfig, dtype=jnp.float32, rngs: Optional[nnx.Rngs] = None):
         self.config = config
-        self.embeddings = nnx.Linear(config.n_mels, config.vocoder_dim, use_bias=False, dtype=dtype, rngs=rngs)
+        self.shd_cfg = config.shd_cfg
+
+        # Apply sharding to embeddings Linear layer
+        self.embeddings = shard(
+            nnx.Linear(config.n_mels, config.vocoder_dim, use_bias=False, dtype=dtype, rngs=rngs),
+            self.shd_cfg.attn_qkvo_weight
+        )
+
+        # RotaryEmbedding doesn't need sharding (only inv_freq parameter, very small)
         self.position_embedding = RotaryEmbedding(config.rope_theta,
                                                   config.vocoder_dim // config.vocoder_attention_heads,
                                                   config.max_audio_seconds * config.sampling_rate // config.hop_length,
                                                   config.rope_type, dtype=dtype)
 
+        # Pass shd_cfg to TransformerLayers
         self.layers = nnx.List([
             TransformerLayer(config.vocoder_dim, config.vocoder_attention_heads, config.vocoder_intermediate_dim,
-                             False, tuple(config.vocoder_attn_window_size), dtype=dtype, rngs=rngs)
+                             False, tuple(config.vocoder_attn_window_size),
+                             self.shd_cfg, dtype=dtype, rngs=rngs)
             for _ in range(config.vocoder_num_layers)
         ])
 
-        self.layer_norm = build_norm(config.ln_type, config.vocoder_dim, dtype, rngs)
-        self.head = ISTFTHead(config.vocoder_dim, config.nfft, config.hop_length, config.vocoder_padding, dtype=dtype,
-                              rngs=rngs)
+        # Apply sharding to LayerNorm
+        self.layer_norm = shard(
+            build_norm(config.ln_type, config.vocoder_dim, dtype, rngs),
+            self.shd_cfg.norm_scale
+        )
+
+        # Pass shd_cfg to ISTFTHead
+        self.head = ISTFTHead(config.vocoder_dim, config.nfft, config.hop_length,
+                             config.vocoder_padding, shd_cfg=self.shd_cfg,
+                             dtype=dtype, rngs=rngs)
 
     def __call__(self, mels: Array, input_length: Array) -> VocoderOutput:
         x = self.embeddings(mels)
@@ -589,25 +827,41 @@ class TransformerVocos(nnx.Module):
 class AudioDecoder(nnx.Module):
     def __init__(self, config: MiMoAudioTokenizerConfig, dtype=jnp.float32, rngs: Optional[nnx.Rngs] = None):
         self.config = config
+        self.shd_cfg = config.shd_cfg
+
         if config.avg_pooler != 1:
-            self.dconv1 = CausalConvTranspose1d(config.d_model, config.d_model, config.avg_pooler, config.avg_pooler,
+            # Pass shd_cfg to CausalConvTranspose1d
+            self.dconv1 = CausalConvTranspose1d(config.d_model, config.d_model, config.avg_pooler,
+                                                config.avg_pooler, shd_cfg=self.shd_cfg,
                                                 dtype=dtype, rngs=rngs)
         else:
             self.dconv1 = None
+
+        # RotaryEmbedding doesn't need sharding (only inv_freq parameter, very small)
         self.position_embedding = RotaryEmbedding(config.rope_theta, config.d_model // config.decoder_attention_heads,
                                                   config.max_audio_seconds * config.sampling_rate // config.hop_length,
                                                   config.rope_type, dtype=dtype)
 
+        # Pass shd_cfg to TransformerLayers
         self.layers = nnx.List([
             TransformerLayer(config.d_model, config.decoder_attention_heads, config.decoder_ffn_dim,
-                             config.decoder_causal, tuple(config.decoder_attn_window_size), dtype=dtype,
-                             rngs=rngs)
+                             config.decoder_causal, tuple(config.decoder_attn_window_size),
+                             self.shd_cfg, dtype=dtype, rngs=rngs)
             for _ in range(config.decoder_layers)
         ])
 
-        self.layer_norm = build_norm(config.ln_type, config.d_model, dtype, rngs)
+        # Apply sharding to LayerNorm
+        self.layer_norm = shard(
+            build_norm(config.ln_type, config.d_model, dtype, rngs),
+            self.shd_cfg.norm_scale
+        )
+
+        # Pass shd_cfg to CausalConvTranspose1d
         self.dconv2 = CausalConvTranspose1d(config.d_model, config.n_mels, config.decoder_kernel_size,
-                                            config.decoder_stride_size, dtype=dtype, rngs=rngs)
+                                            config.decoder_stride_size, shd_cfg=self.shd_cfg,
+                                            dtype=dtype, rngs=rngs)
+
+        # Pass config to TransformerVocos (it will get shd_cfg from config)
         self.vocoder = TransformerVocos(config, dtype=dtype, rngs=rngs)
 
     def __call__(self, audio_embed: Array, input_length: Array) -> Array:
