@@ -97,6 +97,8 @@ class EndToEndTester:
             from bonsai.models.mimo_audio.mimo_audio_tokenizer import MiMoAudioTokenizerConfig
             from bonsai.models.mimo_audio.mimo_audio_tokenizer_params import load_tokenizer_weights_from_safetensors
 
+            # Enable sharding for tokenizer config
+            config_dict['use_sharding'] = True
             self.tokenizer_config = MiMoAudioTokenizerConfig(**config_dict)
 
             self._print("正在加载 tokenizer 配置...")
@@ -104,6 +106,26 @@ class EndToEndTester:
             self._print(f"  - 解码器层数: {self.tokenizer_config.decoder_layers}")
             self._print(f"  - 量化器数量: {self.tokenizer_config.num_quantizers}")
             self._print(f"  - 采样率: {self.tokenizer_config.sampling_rate} Hz")
+            self._print("✅ 已启用 tokenizer sharding")
+
+            # Create JAX mesh for sharding
+            devices = jax.devices()
+            num_devices = len(devices)
+            self._print(f"  - 可用设备数: {num_devices}")
+
+            # Create mesh for tensor parallelism only (fsdp=1 since batch_size=1 in tests)
+            if num_devices >= 2:
+                # Multiple devices: use tensor parallelism only
+                mesh_shape = (1, num_devices)
+                self._print(f"  - Mesh shape: fsdp={mesh_shape[0]}, tp={mesh_shape[1]}")
+            else:
+                # Single device: no sharding
+                mesh_shape = (1, 1)
+                self._print(f"  - Mesh shape: fsdp={mesh_shape[0]}, tp={mesh_shape[1]} (单设备)")
+
+            devices_reshaped = np.array(devices[:mesh_shape[0] * mesh_shape[1]]).reshape(mesh_shape)
+            mesh = jax.sharding.Mesh(devices_reshaped, ('fsdp', 'tp'))
+            self._print(f"✅ 已创建 JAX mesh: {mesh}")
 
             # 加载模型权重
             safetensors_path = os.path.join(self.tokenizer_path, "model.safetensors")
@@ -113,6 +135,7 @@ class EndToEndTester:
                 config=self.tokenizer_config,
                 safetensors_path=safetensors_path,
                 dtype=jnp.float32,  # ✅ Tokenizer必须用float32：quantizer和ISTFT需要
+                mesh=mesh,
                 rngs=nnx.Rngs(0),
             )
 
