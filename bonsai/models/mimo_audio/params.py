@@ -2,6 +2,7 @@ import gc
 import re
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 from flax import nnx
 
@@ -10,35 +11,22 @@ from bonsai.models.qwen2.params import Transform, TRANSFORM_LINEAR, TRANSFORM_NO
 
 def _get_qwen2_key_mapping(prefix: str, num_heads: int, num_kv_heads: int, emb_dim: int, head_dim: int) -> dict[str, tuple[str, Transform]]:
     """Generate key mapping for Qwen2 submodules with prefix."""
-    # Define transforms for Einsum weights (need reshape to 3D)
-    q_reshape = Transform(
-        permute=(1, 0),
-        reshape=(emb_dim, num_heads, head_dim),
-        reshape_first=False,
-    )
-    kv_reshape = Transform(
-        permute=(1, 0),
-        reshape=(emb_dim, num_kv_heads, head_dim),
-        reshape_first=False,
-    )
-    o_reshape = Transform(
-        permute=(1, 0),
-        reshape=(num_heads, head_dim, emb_dim),
-        reshape_first=False,
-    )
-    # Bias transforms
-    q_bias_reshape = Transform(reshape=(num_heads, head_dim))
-    kv_bias_reshape = Transform(reshape=(num_kv_heads, head_dim))
+    # Define transforms for attention weights - use Linear format (transpose only)
+    # Qwen2 uses nnx.Linear, so weights are (in_features, out_features) and bias is (out_features,)
+
+    # Bias transforms - flatten from (num_heads, head_dim) to (num_heads * head_dim,)
+    q_bias_flatten = Transform(reshape=(-1,))
+    kv_bias_flatten = Transform(reshape=(-1,))
 
     return {
         rf"{prefix}\.embed_tokens\.weight": (f"{prefix}.embedder.embedding", TRANSFORM_NONE),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.q_proj\.weight": (rf"{prefix}.layers.\1.attn.q_proj.w", q_reshape),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.k_proj\.weight": (rf"{prefix}.layers.\1.attn.k_proj.w", kv_reshape),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.v_proj\.weight": (rf"{prefix}.layers.\1.attn.v_proj.w", kv_reshape),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.o_proj\.weight": (rf"{prefix}.layers.\1.attn.o_proj.w", o_reshape),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.q_proj\.bias": (rf"{prefix}.layers.\1.attn.q_proj.bias", q_bias_reshape),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.k_proj\.bias": (rf"{prefix}.layers.\1.attn.k_proj.bias", kv_bias_reshape),
-        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.v_proj\.bias": (rf"{prefix}.layers.\1.attn.v_proj.bias", kv_bias_reshape),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.q_proj\.weight": (rf"{prefix}.layers.\1.attn.q_proj.kernel", TRANSFORM_LINEAR),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.k_proj\.weight": (rf"{prefix}.layers.\1.attn.k_proj.kernel", TRANSFORM_LINEAR),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.v_proj\.weight": (rf"{prefix}.layers.\1.attn.v_proj.kernel", TRANSFORM_LINEAR),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.o_proj\.weight": (rf"{prefix}.layers.\1.attn.o_proj.kernel", TRANSFORM_LINEAR),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.q_proj\.bias": (rf"{prefix}.layers.\1.attn.q_proj.bias", q_bias_flatten),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.k_proj\.bias": (rf"{prefix}.layers.\1.attn.k_proj.bias", kv_bias_flatten),
+        rf"{prefix}\.layers\.([0-9]+)\.self_attn\.v_proj\.bias": (rf"{prefix}.layers.\1.attn.v_proj.bias", kv_bias_flatten),
         rf"{prefix}\.layers\.([0-9]+)\.mlp\.gate_proj\.weight": (rf"{prefix}.layers.\1.mlp.gate_proj.kernel", TRANSFORM_LINEAR),
         rf"{prefix}\.layers\.([0-9]+)\.mlp\.up_proj\.weight": (rf"{prefix}.layers.\1.mlp.up_proj.kernel", TRANSFORM_LINEAR),
         rf"{prefix}\.layers\.([0-9]+)\.mlp\.down_proj\.weight": (rf"{prefix}.layers.\1.mlp.down_proj.kernel", TRANSFORM_LINEAR),
@@ -86,6 +74,7 @@ def create_model_with_weights(
     args,
     rngs: nnx.Rngs | None = None,
     dtype: Any = jnp.bfloat16,  # ✅ 恢复：默认bfloat16节省内存，关键部分特殊处理
+    mesh: jax.sharding.Mesh | None = None,  # Add mesh parameter for sharding
 ) -> Any:
     """Create MiMo Audio model and load weights from safetensors."""
     import os
@@ -104,6 +93,9 @@ def create_model_with_weights(
     model = nnx.eval_shape(lambda: FlaxMiMoAudioForCausalLM(config, args, nnx.Rngs(0), dtype=dtype))
     graph_def, abs_state = nnx.split(model)
     pure_state_dict = abs_state.to_pure_dict()
+
+    # Get sharding dict if mesh provided
+    sharding = nnx.get_named_sharding(abs_state, mesh).to_pure_dict() if mesh is not None else None
 
     # Load safetensors
     index_path = os.path.join(model_path, "model.safetensors.index.json")
@@ -166,7 +158,7 @@ def create_model_with_weights(
         try:
             # ✅ 修复：使用传入的dtype而不是硬编码bfloat16
             tensor_jax = jnp.asarray(tensor, dtype=dtype)
-            _assign_weights(keys, tensor_jax, pure_state_dict, torch_key, transform, None)
+            _assign_weights(keys, tensor_jax, pure_state_dict, torch_key, transform, sharding)
             loaded_count += 1
         except KeyError as e:
             # Skip weights for modules that are set to None (e.g., embedder)

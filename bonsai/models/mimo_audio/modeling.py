@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from bonsai.models.qwen2.modeling import Qwen2, ModelConfig as Qwen2Config, Cache
+from bonsai.models.qwen3.modeling import ShardingCfg, shard
 from bonsai.utils.samplers import Sampler, GreedySampler
 
 
@@ -39,9 +40,18 @@ class MiMoAudioConfig:
     input_local_dim: Optional[int] = None
     input_full_attention: Optional[bool] = None
 
+    # Sharding config
+    shd_cfg: ShardingCfg = ShardingCfg.no_sharding()
+
     def __post_init__(self):
         if self.input_local_dim is None:
             self.input_local_dim = self.local_dim
+
+    @classmethod
+    def with_sharding(cls, **kwargs):
+        """Create config with default sharding enabled"""
+        kwargs['shd_cfg'] = ShardingCfg.default()
+        return cls(**kwargs)
 
     def _parse_maybe_list(self, value: str | int, length: int) -> List[int]:
         if isinstance(value, str) and "-" in value:
@@ -129,6 +139,7 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
 
         self.config = config
         self.args = args
+        self.shd_cfg = config.shd_cfg  # Store sharding config
 
         # Parse speech configurations
         self.speech_vocab_sizes = config.parsed_speech_vocab_sizes()
@@ -157,12 +168,15 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
 
         # Local transformer LM heads for each audio channel
         self.local_transformer_lm_heads = nnx.List([
-            nnx.Linear(
-                config.local_dim,
-                self.speech_vocab_sizes[i],
-                use_bias=False,
-                dtype=dtype,  # ✅ 使用传入的dtype而不是硬编码bfloat16
-                rngs=rngs
+            shard(
+                nnx.Linear(
+                    config.local_dim,
+                    self.speech_vocab_sizes[i],
+                    use_bias=False,
+                    dtype=dtype,  # ✅ 使用传入的dtype而不是硬编码bfloat16
+                    rngs=rngs
+                ),
+                self.shd_cfg.emb_dv
             )
             for i in range(self.audio_channels)
         ])
@@ -171,43 +185,55 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         # ⚠️  关键：使用float32保持累加精度，避免tokens重复
         # PyTorch实现中embeddings累加也保持较高精度
         self.speech_embeddings = nnx.List([
-            nnx.Embed(
-                self.speech_vocab_sizes[i],
-                config.input_local_dim,
-                dtype=jnp.float32,  # 使用float32保持累加精度
-                rngs=rngs
+            shard(
+                nnx.Embed(
+                    self.speech_vocab_sizes[i],
+                    config.input_local_dim,
+                    dtype=jnp.float32,  # 使用float32保持累加精度
+                    rngs=rngs
+                ),
+                self.shd_cfg.emb_vd
             )
             for i in range(self.audio_channels)
         ])
 
         # Projection from input_local_dim to local_dim if different
         if config.input_local_dim != config.local_dim:
-            self.speech_embeddings_to_local = nnx.Linear(
-                config.input_local_dim,
-                config.local_dim,
-                use_bias=False,
-                dtype=dtype,  # ✅ 使用传入的dtype而不是硬编码bfloat16
-                rngs=rngs
+            self.speech_embeddings_to_local = shard(
+                nnx.Linear(
+                    config.input_local_dim,
+                    config.local_dim,
+                    use_bias=False,
+                    dtype=dtype,  # ✅ 使用传入的dtype而不是硬编码bfloat16
+                    rngs=rngs
+                ),
+                self.shd_cfg.ffw_weight_df
             )
         else:
             self.speech_embeddings_to_local = None
 
         # Group downcast for combining speech groups
-        self.speech_group_downcast = nnx.Linear(
-            config.input_local_dim * config.group_size,
-            config.hidden_size,
-            use_bias=False,
-            dtype=jnp.bfloat16,
-            rngs=rngs
+        self.speech_group_downcast = shard(
+            nnx.Linear(
+                config.input_local_dim * config.group_size,
+                config.hidden_size,
+                use_bias=False,
+                dtype=jnp.bfloat16,
+                rngs=rngs
+            ),
+            self.shd_cfg.ffw_weight_df
         )
 
         # Hidden states downcast for local transformer
-        self.hidden_states_downcast = nnx.Linear(
-            config.hidden_size,
-            config.local_dim,
-            use_bias=False,
-            dtype=jnp.bfloat16,
-            rngs=rngs
+        self.hidden_states_downcast = shard(
+            nnx.Linear(
+                config.hidden_size,
+                config.local_dim,
+                use_bias=False,
+                dtype=jnp.bfloat16,
+                rngs=rngs
+            ),
+            self.shd_cfg.ffw_weight_df
         )
 
     def _create_qwen2_config(self, config: MiMoAudioConfig) -> Qwen2Config:
@@ -223,6 +249,7 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
             rope_theta=10000,
             norm_eps=1e-6,
             tie_word_embeddings=False,
+            shd_cfg=config.shd_cfg,
         )
 
     def _create_local_qwen2_config(self, config: MiMoAudioConfig) -> Qwen2Config:
@@ -238,6 +265,7 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
             rope_theta=10000,
             norm_eps=1e-6,
             tie_word_embeddings=False,
+            shd_cfg=config.shd_cfg,
         )
 
     def _create_input_local_qwen2_config(self, config: MiMoAudioConfig) -> Qwen2Config:
@@ -259,6 +287,7 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
             norm_eps=1e-6,
             tie_word_embeddings=False,
             use_causal_mask=use_causal_mask,
+            shd_cfg=config.shd_cfg,
         )
 
     def apply_input_local_transformer(
@@ -377,7 +406,8 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         text_zero_mask = (text_input_ids == self.args.empty_idx) | (text_input_ids == -100)
         text_embeds = text_embeds * ~text_zero_mask[..., None]
 
-        return text_embeds + speech_grouped_embeds
+        output = text_embeds + speech_grouped_embeds
+        return shard(output, self.shd_cfg.act_btd)
 
     def forward(
             self,
