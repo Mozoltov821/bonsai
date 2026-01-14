@@ -274,13 +274,6 @@ class StreamingCache:
     processed_lengths: Optional[List[int]] = None
 
 
-# though mimo-audio-tokenizer uses layer norm only, retained this method for compatibility.
-def build_norm(name: str, dim: int, dtype, rngs: Optional[nnx.Rngs] = None) -> nnx.Module:
-    if name == "RMSNorm":
-        return nnx.RMSNorm(dim, epsilon=1e-6, param_dtype=dtype, rngs=rngs)
-    return nnx.LayerNorm(dim, epsilon=1e-6, param_dtype=dtype, rngs=rngs)
-
-
 class RotaryEmbedding(nnx.Module):
     def __init__(self, base: float, dim: int, max_seq_len: int, rope_type: str = "default", dtype=jnp.float32):
         self.base = base
@@ -655,7 +648,7 @@ class AudioEncoder(nnx.Module):
 
         # Apply sharding to LayerNorm
         self.layer_norm = shard(
-            build_norm(config.ln_type, config.d_model, dtype, rngs),
+            nnx.LayerNorm(config.d_model, epsilon=1e-6, param_dtype=dtype, rngs=rngs),
             self.shd_cfg.norm_scale
         )
 
@@ -675,7 +668,7 @@ class AudioEncoder(nnx.Module):
                 self.shd_cfg.conv_weight
             )
             self.down_norm = shard(
-                build_norm(config.ln_type, config.d_model, dtype, rngs),
+                nnx.LayerNorm(config.d_model, epsilon=1e-6, param_dtype=dtype, rngs=rngs),
                 self.shd_cfg.norm_scale
             )
         else:
@@ -800,7 +793,7 @@ class TransformerVocos(nnx.Module):
 
         # Apply sharding to LayerNorm
         self.layer_norm = shard(
-            build_norm(config.ln_type, config.vocoder_dim, dtype, rngs),
+            nnx.LayerNorm(config.vocoder_dim, epsilon=1e-6, param_dtype=dtype, rngs=rngs),
             self.shd_cfg.norm_scale
         )
 
@@ -852,7 +845,7 @@ class AudioDecoder(nnx.Module):
 
         # Apply sharding to LayerNorm
         self.layer_norm = shard(
-            build_norm(config.ln_type, config.d_model, dtype, rngs),
+            nnx.LayerNorm(config.d_model, epsilon=1e-6, param_dtype=dtype, rngs=rngs),
             self.shd_cfg.norm_scale
         )
 
