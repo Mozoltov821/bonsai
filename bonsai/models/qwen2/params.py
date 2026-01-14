@@ -23,50 +23,32 @@ TRANSFORM_NONE = Transform()
 
 
 def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig) -> dict[str, tuple[str | None, Transform | None]]:
-    # For Einsum weights, we need to reshape to match (D, N, H) format instead of (D, N*H)
-    # q_proj: (emb_dim, emb_dim) -> (emb_dim, num_heads, head_dim)
-    q_reshape = Transform(
-        permute=(1, 0),
-        reshape=(cfg.emb_dim, cfg.num_heads, cfg.head_dim),
-        reshape_first=False,
-    )
-    # k_proj, v_proj: (emb_dim, num_kv_heads*head_dim) -> (emb_dim, num_kv_heads, head_dim)
-    kv_reshape = Transform(
-        permute=(1, 0),
-        reshape=(cfg.emb_dim, cfg.num_kv_heads, cfg.head_dim),
-        reshape_first=False,
-    )
-    # o_proj: (emb_dim, emb_dim) -> (num_heads, head_dim, emb_dim)
-    o_reshape = Transform(
-        permute=(1, 0),
-        reshape=(cfg.num_heads, cfg.head_dim, cfg.emb_dim),
-        reshape_first=False,
-    )
-    # Bias transforms: need to reshape bias to match Einsum output dims
-    # q_bias: (emb_dim,) -> (num_heads, head_dim)
-    q_bias_reshape = Transform(reshape=(cfg.num_heads, cfg.head_dim))
-    # k_bias, v_bias: (num_kv_heads*head_dim,) -> (num_kv_heads, head_dim)
-    kv_bias_reshape = Transform(reshape=(cfg.num_kv_heads, cfg.head_dim))
+    # For Linear layers, we only need simple transpose from PyTorch's (out, in) to JAX's (in, out)
 
     return {
         r"model\.embed_tokens\.weight": ("embedder.embedding", TRANSFORM_NONE),
-        r"model\.layers\.([0-9]+)\.self_attn\.q_proj\.weight": (r"layers.\1.attn.q_proj.w", q_reshape),
-        r"model\.layers\.([0-9]+)\.self_attn\.k_proj\.weight": (r"layers.\1.attn.k_proj.w", kv_reshape),
-        r"model\.layers\.([0-9]+)\.self_attn\.v_proj\.weight": (r"layers.\1.attn.v_proj.w", kv_reshape),
-        r"model\.layers\.([0-9]+)\.self_attn\.o_proj\.weight": (r"layers.\1.attn.o_proj.w", o_reshape),
-        r"model\.layers\.([0-9]+)\.self_attn\.q_proj\.bias": (r"layers.\1.attn.q_proj.bias", q_bias_reshape),
-        r"model\.layers\.([0-9]+)\.self_attn\.k_proj\.bias": (r"layers.\1.attn.k_proj.bias", kv_bias_reshape),
-        r"model\.layers\.([0-9]+)\.self_attn\.v_proj\.bias": (r"layers.\1.attn.v_proj.bias", kv_bias_reshape),
+        # Attention projections: simple transpose for Linear layers
+        r"model\.layers\.([0-9]+)\.self_attn\.q_proj\.weight": (r"layers.\1.attn.q_proj.kernel", TRANSFORM_LINEAR),
+        r"model\.layers\.([0-9]+)\.self_attn\.k_proj\.weight": (r"layers.\1.attn.k_proj.kernel", TRANSFORM_LINEAR),
+        r"model\.layers\.([0-9]+)\.self_attn\.v_proj\.weight": (r"layers.\1.attn.v_proj.kernel", TRANSFORM_LINEAR),
+        r"model\.layers\.([0-9]+)\.self_attn\.o_proj\.weight": (r"layers.\1.attn.o_proj.kernel", TRANSFORM_LINEAR),
+        # Attention biases: no transformation needed
+        r"model\.layers\.([0-9]+)\.self_attn\.q_proj\.bias": (r"layers.\1.attn.q_proj.bias", TRANSFORM_NONE),
+        r"model\.layers\.([0-9]+)\.self_attn\.k_proj\.bias": (r"layers.\1.attn.k_proj.bias", TRANSFORM_NONE),
+        r"model\.layers\.([0-9]+)\.self_attn\.v_proj\.bias": (r"layers.\1.attn.v_proj.bias", TRANSFORM_NONE),
+        # MLP projections
         r"model\.layers\.([0-9]+)\.mlp\.gate_proj\.weight": (r"layers.\1.mlp.gate_proj.kernel", TRANSFORM_LINEAR),
         r"model\.layers\.([0-9]+)\.mlp\.up_proj\.weight": (r"layers.\1.mlp.up_proj.kernel", TRANSFORM_LINEAR),
         r"model\.layers\.([0-9]+)\.mlp\.down_proj\.weight": (r"layers.\1.mlp.down_proj.kernel", TRANSFORM_LINEAR),
+        # Normalization layers
         r"model\.norm\.weight": ("final_norm.scale", TRANSFORM_NONE),
         r"model\.layers\.([0-9]+)\.input_layernorm\.weight": (r"layers.\1.input_layernorm.scale", TRANSFORM_NONE),
         r"model\.layers\.([0-9]+)\.post_attention_layernorm\.weight": (
             r"layers.\1.post_attention_layernorm.scale",
             TRANSFORM_NONE,
         ),
-        r"lm_head\.weight": ("lm_head.w", TRANSFORM_LINEAR),
+        # LM head
+        r"lm_head\.weight": ("lm_head.kernel", TRANSFORM_LINEAR),
     }
 
 
@@ -156,7 +138,7 @@ def create_model_from_safe_tensors(
         )
 
     if cfg.tie_word_embeddings:
-        state_dict["lm_head"]["w"] = state_dict["embedder"]["embedding"].T
+        state_dict["lm_head"]["kernel"] = state_dict["embedder"]["embedding"].T
 
     model = nnx.merge(graph_def, state_dict)
     gc.collect()
