@@ -395,10 +395,10 @@ class EndToEndTester:
             self._print(f"  - 词表大小: {config_dict.get('vocab_size')}")
             self._print(f"  - 层数: {config_dict.get('num_hidden_layers')}")
 
-            # Create config
-            config = MiMoAudioConfig(
-                **{k: v for k, v in config_dict.items() if k in MiMoAudioConfig.__dataclass_fields__}
-            )
+            # Create config with sharding enabled
+            config_kwargs = {k: v for k, v in config_dict.items() if k in MiMoAudioConfig.__dataclass_fields__}
+            config = MiMoAudioConfig.with_sharding(**config_kwargs)
+            self._print("✅ 已启用模型 sharding")
 
             # ✅ 关键修复：从tokenizer动态获取special token IDs
             # config.json中的IDs可能是错误的或过时的
@@ -422,13 +422,33 @@ class EndToEndTester:
             self._print(f"  - EOSTM: {args.eostm_idx}")
             self._print(f"  - Empty: {args.empty_idx}")
 
-            # Load model
+            # Create JAX mesh for sharding
+            devices = jax.devices()
+            num_devices = len(devices)
+            self._print(f"  - 可用设备数: {num_devices}")
+
+            # Create mesh for tensor parallelism only (fsdp=1 since batch_size=1 in tests)
+            if num_devices >= 2:
+                # Multiple devices: use tensor parallelism only
+                mesh_shape = (1, num_devices)
+                self._print(f"  - Mesh shape: fsdp={mesh_shape[0]}, tp={mesh_shape[1]}")
+            else:
+                # Single device: no sharding
+                mesh_shape = (1, 1)
+                self._print(f"  - Mesh shape: fsdp={mesh_shape[0]}, tp={mesh_shape[1]} (单设备)")
+
+            devices_reshaped = np.array(devices[:mesh_shape[0] * mesh_shape[1]]).reshape(mesh_shape)
+            mesh = jax.sharding.Mesh(devices_reshaped, ('fsdp', 'tp'))
+            self._print(f"✅ 已创建 JAX mesh: {mesh}")
+
+            # Load model with sharding
             start_time = time.time()
             self.main_model = create_model_with_weights(
                 model_path=self.model_path,
                 config=config,
                 args=args,
                 rngs=nnx.Rngs(0),
+                mesh=mesh,
             )
             load_time = time.time() - start_time
 
