@@ -971,6 +971,10 @@ class EndToEndTester:
                 self._print("主模型加载失败，跳过测试", "ERROR")
                 return False
 
+        # ✅ 导入 JIT 编译的函数以提升推理速度
+        from bonsai.models.mimo_audio.modeling import forward_jit, local_forward_jit
+        self._print("✅ 使用 JIT 编译加速推理", "INFO")
+
         try:
             # 加载文本 tokenizer
             try:
@@ -1075,8 +1079,8 @@ class EndToEndTester:
 
             # Prefill - 使用正确的pad_id
             pad_id = text_tokenizer.pad_token_id if text_tokenizer else 0
-            text_logits, local_hidden_states = self.main_model.forward(
-                input_ids, cache, pad_id=pad_id
+            text_logits, local_hidden_states = forward_jit(
+                self.main_model, input_ids, cache, pad_id
             )
 
             self._print(f"Prefill 完成")
@@ -1194,8 +1198,8 @@ class EndToEndTester:
                             next_input = next_input.at[0, ch + 1, i].set(audio_tokens[0, i, ch])
 
                 # 继续生成
-                text_logits, local_hidden_states = self.main_model.forward(
-                    next_input, cache, pad_id=pad_id
+                text_logits, local_hidden_states = forward_jit(
+                    self.main_model, next_input, cache, pad_id
                 )
 
                 if step % 2 == 0:

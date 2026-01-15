@@ -661,6 +661,56 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         return input_ids
 
 
+# ============================================================================
+# JIT-compiled functions for fast inference
+# ============================================================================
+
+@jax.jit
+def forward_jit(
+    model: FlaxMiMoAudioForCausalLM,
+    input_ids: jnp.ndarray,
+    cache: Cache,
+    pad_id: int = 0,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    JIT-compiled forward pass for fast inference.
+
+    Args:
+        model: FlaxMiMoAudioForCausalLM instance
+        input_ids: [B, audio_channels + 1, T * group_size]
+        cache: Cache for KV storage
+        pad_id: Padding token ID
+
+    Returns:
+        text_logits: [B, 1, vocab_size]
+        local_hidden_states: [B, 1, local_dim]
+    """
+    return model.forward(input_ids, cache, pad_id)
+
+
+@jax.jit
+def local_forward_jit(
+    model: FlaxMiMoAudioForCausalLM,
+    local_embeds: jnp.ndarray,
+    key: jax.random.PRNGKey,
+) -> jnp.ndarray:
+    """
+    JIT-compiled local forward pass for audio generation.
+
+    NOTE: This version uses greedy sampling (no sampler parameter for JIT simplicity).
+    For temperature-based sampling, use model.local_forward() directly.
+
+    Args:
+        model: FlaxMiMoAudioForCausalLM instance
+        local_embeds: [B, 1, local_dim]
+        key: Random key (used if needed in future, currently greedy)
+
+    Returns:
+        audio_tokens: [B, group_size, audio_channels]
+    """
+    # Use greedy sampling for JIT-compiled version
+    return model.local_forward(local_embeds, key, local_sampler=None)
+
 
 # Example usage:
 if __name__ == "__main__":
