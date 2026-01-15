@@ -975,6 +975,25 @@ class EndToEndTester:
         from bonsai.models.mimo_audio.modeling import forward_jit, local_forward_jit
         self._print("✅ 使用 JIT 编译加速推理", "INFO")
 
+        # ✅ 预热 JIT 编译：使用小输入触发编译
+        self._print("正在预热 JIT 编译（第一次调用会触发编译）...", "INFO")
+        warmup_cache = self.main_model.model.init_cache(
+            self.main_model.qwen2_config,
+            batch_size=1,
+            token_len=1,
+            generate_steps=0,
+            dtype=jnp.bfloat16,
+        )
+        warmup_input = jnp.zeros(
+            (1, self.main_model.audio_channels + 1, self.main_model.group_size),
+            dtype=jnp.int32
+        )
+        warmup_start = time.time()
+        _, _, _ = forward_jit(self.main_model, warmup_input, warmup_cache, pad_id=0)
+        warmup_time = time.time() - warmup_start
+        self._print(f"JIT 预热完成，耗时 {warmup_time:.2f}秒（包含编译时间）", "SUCCESS")
+        self._print("后续推理将直接使用编译后的代码，速度会大幅提升", "INFO")
+
         try:
             # 加载文本 tokenizer
             try:
@@ -994,8 +1013,8 @@ class EndToEndTester:
 
             # 文本通道：使用TTS prompt格式（关键！）
             if text_tokenizer:
-                # text_to_speak = "床前明月光，疑是地上霜，举头望明月，低头思故乡。"  # 使用简短文本
-                text_to_speak = "在那边，在大海的那一头，老人正睡在自己的棚子里。他依然脸朝下睡着，孩子坐在他身边守着他。老人正梦见狮子。一个人并不是生来要给打败的。你尽可以把他消灭掉，可就是打不败他。"
+                text_to_speak = "床前明月光，疑是地上霜，举头望明月，低头思故乡。"  # 使用简短文本
+                # text_to_speak = "在那边，在大海的那一头，老人正睡在自己的棚子里。他依然脸朝下睡着，孩子坐在他身边守着他。老人正梦见狮子。一个人并不是生来要给打败的。你尽可以把他消灭掉，可就是打不败他。"
                 tts_template = "请将这段文字转换为语音，使用沉稳的男性音色，富有力量感"
 
                 # 官方TTS格式：
@@ -1064,7 +1083,7 @@ class EndToEndTester:
             self._print(f"文本 pad_id: {text_tokenizer.pad_token_id if text_tokenizer else 0}")
 
             # 初始化 cache
-            generate_steps = 200  # 增加到30步，生成更长的序列
+            generate_steps = 50  # 增加到30步，生成更长的序列
             cache = self.main_model.model.init_cache(
                 self.main_model.qwen2_config,
                 batch_size,
@@ -1079,7 +1098,7 @@ class EndToEndTester:
 
             # Prefill - 使用正确的pad_id
             pad_id = text_tokenizer.pad_token_id if text_tokenizer else 0
-            text_logits, local_hidden_states = forward_jit(
+            text_logits, local_hidden_states, cache = forward_jit(
                 self.main_model, input_ids, cache, pad_id
             )
 
@@ -1198,7 +1217,7 @@ class EndToEndTester:
                             next_input = next_input.at[0, ch + 1, i].set(audio_tokens[0, i, ch])
 
                 # 继续生成
-                text_logits, local_hidden_states = forward_jit(
+                text_logits, local_hidden_states, cache = forward_jit(
                     self.main_model, next_input, cache, pad_id
                 )
 

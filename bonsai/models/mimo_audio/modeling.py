@@ -671,9 +671,12 @@ def forward_jit(
     input_ids: jnp.ndarray,
     cache: Cache,
     pad_id: int = 0,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+) -> Tuple[jnp.ndarray, jnp.ndarray, Cache]:
     """
     JIT-compiled forward pass for fast inference.
+
+    Similar to qwen2's forward function, this returns the cache to enable
+    proper JAX tracing of stateful computations.
 
     Args:
         model: FlaxMiMoAudioForCausalLM instance
@@ -684,8 +687,10 @@ def forward_jit(
     Returns:
         text_logits: [B, 1, vocab_size]
         local_hidden_states: [B, 1, local_dim]
+        cache: Updated cache (for JAX tracing)
     """
-    return model.forward(input_ids, cache, pad_id)
+    text_logits, local_hidden_states = model.forward(input_ids, cache, pad_id)
+    return text_logits, local_hidden_states, cache
 
 
 @jax.jit
