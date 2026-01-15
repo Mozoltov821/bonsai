@@ -73,12 +73,12 @@ class EndToEndTester:
             print(f"{prefix} {message}")
 
     def _clear_memory(self):
-        """清理 JAX 缓存和 Python 垃圾以释放内存。"""
-        # 清理 JAX 编译缓存
-        jax.clear_caches()
+        """清理 Python 垃圾以释放内存（保留 JAX 编译缓存以提升性能）。"""
+        # ✅ 不清理 JAX 编译缓存，以避免重新编译开销
+        # jax.clear_caches()  # 保留编译缓存以提升推理速度
         # 强制垃圾回收
         gc.collect()
-        self._print("已清理内存 (JAX 缓存 + GC)", "INFO")
+        self._print("已清理内存 (GC only, 保留编译缓存)", "INFO")
 
     def test_tokenizer_loading(self) -> bool:
         """测试 1: 加载音频 tokenizer 并验证结构"""
@@ -1093,10 +1093,10 @@ class EndToEndTester:
 
             # 创建 sampler（使用官方推荐参数）
             from bonsai.models.mimo_audio.modeling import MiMoSampler, MiMoSamplerConfig
-            # text_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.6, top_k=50, top_p=1.0, do_sample=True))
-            # audio_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.9, top_k=50, top_p=0.95, do_sample=True))
-            text_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.6, top_k=50, top_p=1.0, do_sample=False))
-            audio_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.9, top_k=50, top_p=0.95, do_sample=False))
+            text_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.6, top_k=50, top_p=1.0, do_sample=True))
+            audio_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.9, top_k=50, top_p=0.95, do_sample=True))
+            # text_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.6, top_k=50, top_p=1.0, do_sample=False))
+            # audio_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.9, top_k=50, top_p=0.95, do_sample=False))
 
             # Random key for sampling
             rng_key = jax.random.key(42)
