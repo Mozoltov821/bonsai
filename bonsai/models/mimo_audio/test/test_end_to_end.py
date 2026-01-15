@@ -233,7 +233,7 @@ class EndToEndTester:
         self._print("测试 3: Mel 频谱提取", "SECTION")
 
         try:
-            from bonsai.models.mimo_audio.melSpectrogram import MelSpectrogram
+            from bonsai.models.mimo_audio.mimo_audio_tokenizer import MelSpectrogram
 
             # Create mel extractor
             self.mel_extractor = MelSpectrogram(

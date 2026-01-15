@@ -13,8 +13,7 @@ from typing import Union, Optional, List
 import soundfile as sf
 
 from bonsai.models.mimo_audio.process_speechdata import InputSegment, StreamingInputSegment
-from bonsai.models.mimo_audio.melSpectrogram import MelSpectrogram
-from bonsai.models.mimo_audio.mimo_audio_tokenizer import MiMoAudioTokenizerConfig
+from bonsai.models.mimo_audio.mimo_audio_tokenizer import MiMoAudioTokenizerConfig, MelSpectrogram
 from bonsai.models.mimo_audio.mimo_audio_tokenizer_params import load_tokenizer_weights_from_safetensors
 from bonsai.models.mimo_audio.params import create_model_with_weights
 from bonsai.models.mimo_audio.templates import asr_en_templates, asr_zh_templates, tts_en_templates, tts_zh_templates

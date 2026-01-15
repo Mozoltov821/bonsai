@@ -7,6 +7,7 @@ from bonsai.models.mimo_audio.modeling import (
 from bonsai.models.mimo_audio.mimo_audio_tokenizer import (
     FlaxMiMoAudioTokenizer,
     MiMoAudioTokenizerConfig,
+    MelSpectrogram,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "FlaxMiMoAudioForCausalLM",
     "FlaxMiMoAudioTokenizer",
     "MiMoAudioTokenizerConfig",
+    "MelSpectrogram",
 ]

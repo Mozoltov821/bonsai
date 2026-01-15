@@ -8,7 +8,7 @@ from flax import nnx
 from typing import Union, Optional, List
 import soundfile as sf
 from process_speechdata import InputSegment, StreamingInputSegment
-from bonsai.models.mimo_audio.melSpectrogram import MelSpectrogram
+from bonsai.models.mimo_audio.mimo_audio_tokenizer import MelSpectrogram
 from bonsai.models.mimo_audio.mimo_audio_tokenizer_params import load_tokenizer_weights_from_safetensors
 from bonsai.models.mimo_audio.params import create_model_with_weights
 

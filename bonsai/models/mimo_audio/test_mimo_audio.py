@@ -12,11 +12,33 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from bonsai.models.mimo_audio.mimo_audio import MimoAudio
 
 
+def get_modelscope_cache_dir(model_id):
+    """Get modelscope cache directory for a model"""
+    cache_root = os.path.expanduser("~/.cache/modelscope/hub")
+
+    # Convert model_id to cache path (e.g., "xiaomi/MiMo-Audio" -> "xiaomi/MiMo-Audio")
+    model_dir = os.path.join(cache_root, model_id)
+
+    if os.path.exists(model_dir):
+        return model_dir
+
+    # Try alternative: organization___model format
+    alt_model_dir = model_id.replace("/", "___")
+    alt_path = os.path.join(cache_root, alt_model_dir)
+    if os.path.exists(alt_path):
+        return alt_path
+
+    raise FileNotFoundError(f"Model not found in modelscope cache: {model_id}\n"
+                           f"Tried: {model_dir} and {alt_path}")
+
+
 def test_initialization(model_path, tokenizer_path, use_sharding=True):
     """Test model initialization"""
     print(f"\n{'='*60}")
     print("Test 1: Model Initialization")
     print(f"{'='*60}")
+    print(f"Model path: {model_path}")
+    print(f"Tokenizer path: {tokenizer_path}")
 
     start_time = time.time()
     mimo = MimoAudio(
@@ -103,28 +125,90 @@ def test_tts(mimo, text, output_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test MiMo-Audio JAX interface")
-    parser.add_argument("--model_path", required=True, help="Path to main model")
-    parser.add_argument("--tokenizer_path", required=True, help="Path to audio tokenizer")
-    parser.add_argument("--audio_path", help="Path to test audio file for ASR")
-    parser.add_argument("--test_text", default="你好，世界！", help="Test text for TTS")
-    parser.add_argument("--output_path", default="test_output.wav", help="Output path for TTS")
-    parser.add_argument("--no_sharding", action="store_true", help="Disable sharding")
+    parser = argparse.ArgumentParser(
+        description="Test MiMo-Audio JAX interface",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Using modelscope cache (recommended)
+  python test_mimo_audio.py \\
+      --model_id xiaomi/MiMo-Audio \\
+      --tokenizer_id xiaomi/MiMo-Audio-Tokenizer
+
+  # Using explicit paths
+  python test_mimo_audio.py \\
+      --model_path /path/to/model \\
+      --tokenizer_path /path/to/tokenizer
+
+  # With audio test
+  python test_mimo_audio.py \\
+      --model_id xiaomi/MiMo-Audio \\
+      --tokenizer_id xiaomi/MiMo-Audio-Tokenizer \\
+      --audio_path test.wav
+"""
+    )
+
+    # Model location arguments (use either IDs or paths)
+    model_group = parser.add_argument_group('Model Location')
+    model_group.add_argument("--model_id", help="ModelScope model ID (e.g., xiaomi/MiMo-Audio)")
+    model_group.add_argument("--tokenizer_id", help="ModelScope tokenizer ID (e.g., xiaomi/MiMo-Audio-Tokenizer)")
+    model_group.add_argument("--model_path", help="Direct path to main model (alternative to --model_id)")
+    model_group.add_argument("--tokenizer_path", help="Direct path to audio tokenizer (alternative to --tokenizer_id)")
+
+    # Test arguments
+    test_group = parser.add_argument_group('Test Options')
+    test_group.add_argument("--audio_path", help="Path to test audio file for ASR")
+    test_group.add_argument("--test_text", default="你好，世界！", help="Test text for TTS")
+    test_group.add_argument("--output_path", default="test_output.wav", help="Output path for TTS")
+    test_group.add_argument("--no_sharding", action="store_true", help="Disable sharding")
 
     args = parser.parse_args()
+
+    # Determine model and tokenizer paths
+    if args.model_id:
+        try:
+            model_path = get_modelscope_cache_dir(args.model_id)
+            print(f"Found model in modelscope cache: {model_path}")
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
+            print("\nPlease download the model first using:")
+            print(f"  from modelscope import snapshot_download")
+            print(f"  snapshot_download('{args.model_id}')")
+            return 1
+    elif args.model_path:
+        model_path = args.model_path
+    else:
+        print("Error: Must specify either --model_id or --model_path")
+        parser.print_help()
+        return 1
+
+    if args.tokenizer_id:
+        try:
+            tokenizer_path = get_modelscope_cache_dir(args.tokenizer_id)
+            print(f"Found tokenizer in modelscope cache: {tokenizer_path}")
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
+            print("\nPlease download the tokenizer first using:")
+            print(f"  from modelscope import snapshot_download")
+            print(f"  snapshot_download('{args.tokenizer_id}')")
+            return 1
+    elif args.tokenizer_path:
+        tokenizer_path = args.tokenizer_path
+    else:
+        print("Error: Must specify either --tokenizer_id or --tokenizer_path")
+        parser.print_help()
+        return 1
 
     print("\n" + "="*60)
     print("MiMo-Audio JAX Interface Test Suite")
     print("="*60)
-    print(f"Model path: {args.model_path}")
-    print(f"Tokenizer path: {args.tokenizer_path}")
     print(f"Sharding: {'Disabled' if args.no_sharding else 'Enabled'}")
 
     try:
         # Test 1: Initialization
         mimo = test_initialization(
-            args.model_path,
-            args.tokenizer_path,
+            model_path,
+            tokenizer_path,
             use_sharding=not args.no_sharding
         )
 
