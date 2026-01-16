@@ -97,8 +97,8 @@ class EndToEndTester:
             from bonsai.models.mimo_audio.mimo_audio_tokenizer import MiMoAudioTokenizerConfig
             from bonsai.models.mimo_audio.mimo_audio_tokenizer_params import load_tokenizer_weights_from_safetensors
 
-            # Enable sharding for tokenizer config
-            config_dict['use_sharding'] = True
+            # ✅ 禁用 sharding 以提升单卡推理速度（避免多卡通信开销）
+            config_dict['use_sharding'] = False
             self.tokenizer_config = MiMoAudioTokenizerConfig(**config_dict)
 
             self._print("正在加载 tokenizer 配置...")
@@ -106,28 +106,9 @@ class EndToEndTester:
             self._print(f"  - 解码器层数: {self.tokenizer_config.decoder_layers}")
             self._print(f"  - 量化器数量: {self.tokenizer_config.num_quantizers}")
             self._print(f"  - 采样率: {self.tokenizer_config.sampling_rate} Hz")
-            self._print("✅ 已启用 tokenizer sharding")
+            self._print("✅ 已禁用 sharding（单卡推理模式）")
 
-            # Create JAX mesh for sharding
-            devices = jax.devices()
-            num_devices = len(devices)
-            self._print(f"  - 可用设备数: {num_devices}")
-
-            # Create mesh for tensor parallelism only (fsdp=1 since batch_size=1 in tests)
-            if num_devices >= 2:
-                # Multiple devices: use tensor parallelism only
-                mesh_shape = (1, num_devices)
-                self._print(f"  - Mesh shape: fsdp={mesh_shape[0]}, tp={mesh_shape[1]}")
-            else:
-                # Single device: no sharding
-                mesh_shape = (1, 1)
-                self._print(f"  - Mesh shape: fsdp={mesh_shape[0]}, tp={mesh_shape[1]} (单设备)")
-
-            devices_reshaped = np.array(devices[:mesh_shape[0] * mesh_shape[1]]).reshape(mesh_shape)
-            mesh = jax.sharding.Mesh(devices_reshaped, ('fsdp', 'tp'))
-            self._print(f"✅ 已创建 JAX mesh: {mesh}")
-
-            # 加载模型权重
+            # 加载模型权重（不使用 mesh）
             safetensors_path = os.path.join(self.tokenizer_path, "model.safetensors")
             start_time = time.time()
 
@@ -135,7 +116,7 @@ class EndToEndTester:
                 config=self.tokenizer_config,
                 safetensors_path=safetensors_path,
                 dtype=jnp.float32,  # ✅ Tokenizer必须用float32：quantizer和ISTFT需要
-                mesh=mesh,
+                mesh=None,  # 不使用 sharding
                 rngs=nnx.Rngs(0),
             )
 
@@ -147,8 +128,6 @@ class EndToEndTester:
                 "load_time": load_time,
             }
 
-            # 加载后清理内存
-            self._clear_memory()
             return True
 
         except Exception as e:
@@ -214,8 +193,6 @@ class EndToEndTester:
 
             self._print("Tokenizer forward pass 测试通过", "SUCCESS")
 
-            # Clear memory after forward pass
-            self._clear_memory()
             return True
 
         except Exception as e:
@@ -418,10 +395,10 @@ class EndToEndTester:
             self._print(f"  - 词表大小: {config_dict.get('vocab_size')}")
             self._print(f"  - 层数: {config_dict.get('num_hidden_layers')}")
 
-            # Create config with sharding enabled
+            # Create config without sharding (单卡推理模式)
             config_kwargs = {k: v for k, v in config_dict.items() if k in MiMoAudioConfig.__dataclass_fields__}
-            config = MiMoAudioConfig.with_sharding(**config_kwargs)
-            self._print("✅ 已启用模型 sharding")
+            config = MiMoAudioConfig(**config_kwargs)
+            self._print("✅ 已禁用模型 sharding（单卡推理模式）")
 
             # ✅ 关键修复：从tokenizer动态获取special token IDs
             # config.json中的IDs可能是错误的或过时的
@@ -445,33 +422,14 @@ class EndToEndTester:
             self._print(f"  - EOSTM: {args.eostm_idx}")
             self._print(f"  - Empty: {args.empty_idx}")
 
-            # Create JAX mesh for sharding
-            devices = jax.devices()
-            num_devices = len(devices)
-            self._print(f"  - 可用设备数: {num_devices}")
-
-            # Create mesh for tensor parallelism only (fsdp=1 since batch_size=1 in tests)
-            if num_devices >= 2:
-                # Multiple devices: use tensor parallelism only
-                mesh_shape = (1, num_devices)
-                self._print(f"  - Mesh shape: fsdp={mesh_shape[0]}, tp={mesh_shape[1]}")
-            else:
-                # Single device: no sharding
-                mesh_shape = (1, 1)
-                self._print(f"  - Mesh shape: fsdp={mesh_shape[0]}, tp={mesh_shape[1]} (单设备)")
-
-            devices_reshaped = np.array(devices[:mesh_shape[0] * mesh_shape[1]]).reshape(mesh_shape)
-            mesh = jax.sharding.Mesh(devices_reshaped, ('fsdp', 'tp'))
-            self._print(f"✅ 已创建 JAX mesh: {mesh}")
-
-            # Load model with sharding
+            # Load model without sharding
             start_time = time.time()
             self.main_model = create_model_with_weights(
                 model_path=self.model_path,
                 config=config,
                 args=args,
                 rngs=nnx.Rngs(0),
-                mesh=mesh,
+                mesh=None,  # 不使用 sharding
             )
             load_time = time.time() - start_time
 
@@ -1083,7 +1041,7 @@ class EndToEndTester:
             self._print(f"文本 pad_id: {text_tokenizer.pad_token_id if text_tokenizer else 0}")
 
             # 初始化 cache
-            generate_steps = 50  # 增加到30步，生成更长的序列
+            generate_steps = 100  # 增加到30步，生成更长的序列
             cache = self.main_model.model.init_cache(
                 self.main_model.qwen2_config,
                 batch_size,

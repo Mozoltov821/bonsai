@@ -504,11 +504,11 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         segment_ids = jnp.ones((B, 1), dtype=jnp.int32)
 
         for t in range(delay_iters):
-            # Run local transformer forward (ensure bfloat16)
-            x = local_embeds.astype(jnp.bfloat16)
-            for i, layer in enumerate(self.local_transformer.layers):
-                x = layer(x, cache[i], segment_ids)
-            hidden_state = self.local_transformer.final_norm(x)  # [B, 1, local_dim]
+            # ✅ 使用 JIT 编译的 transformer forward（加速核心计算）
+            # 必须返回 cache 以确保状态正确更新
+            hidden_state, cache = _local_transformer_step_jit(
+                self.local_transformer, local_embeds, cache, segment_ids
+            )  # [B, 1, local_dim]
 
             # Reset embeddings for next iteration
             next_local_embeds = jnp.zeros_like(local_embeds)
@@ -664,6 +664,37 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
 # ============================================================================
 # JIT-compiled functions for fast inference
 # ============================================================================
+
+@jax.jit
+def _local_transformer_step_jit(
+    local_transformer: nnx.Module,
+    local_embeds: jnp.ndarray,
+    cache: Cache,
+    segment_ids: jnp.ndarray,
+) -> Tuple[jnp.ndarray, Cache]:
+    """
+    JIT-compiled single step of local transformer forward pass.
+
+    This is a helper function to accelerate the inner loop of local_forward.
+    Being a module-level function (not instance method) allows JAX to properly
+    JIT compile it.
+
+    Args:
+        local_transformer: The local transformer module
+        local_embeds: [B, 1, local_dim]
+        cache: Cache for local transformer
+        segment_ids: [B, 1]
+
+    Returns:
+        hidden_state: [B, 1, local_dim]
+        cache: Updated cache (IMPORTANT for correct behavior)
+    """
+    x = local_embeds.astype(jnp.bfloat16)
+    for i, layer in enumerate(local_transformer.layers):
+        x = layer(x, cache[i], segment_ids)
+    hidden_state = local_transformer.final_norm(x)
+    return hidden_state, cache
+
 
 @jax.jit
 def forward_jit(
