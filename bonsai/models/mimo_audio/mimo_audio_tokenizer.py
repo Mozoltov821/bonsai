@@ -19,9 +19,6 @@ def shard(x: Array, s: ShardingSpec) -> Array:
     return x
 
 
-
-
-
 @dataclass(slots=True, frozen=True)
 class MiMoShardingCfg:
     """Sharding configuration for MiMo Audio Tokenizer.
@@ -30,38 +27,38 @@ class MiMoShardingCfg:
     """
     # Conv层权重 sharding
     conv_weight: ShardingSpec  # (in_channels, out_channels, kernel_size)
-    conv_bias: ShardingSpec    # (out_channels,)
+    conv_bias: ShardingSpec  # (out_channels,)
 
     # Transformer权重 sharding (Encoder/Decoder/Vocoder共用)
     attn_qkvo_weight: ShardingSpec  # (d_model, d_model)
-    attn_qkv_bias: ShardingSpec     # (d_model,)
-    attn_out_bias: ShardingSpec     # (d_model,)
+    attn_qkv_bias: ShardingSpec  # (d_model,)
+    attn_out_bias: ShardingSpec  # (d_model,)
 
     # FFN权重 sharding
-    ffn_weight_in: ShardingSpec   # (d_model, ffn_dim)
+    ffn_weight_in: ShardingSpec  # (d_model, ffn_dim)
     ffn_weight_out: ShardingSpec  # (ffn_dim, d_model)
-    ffn_bias: ShardingSpec        # (ffn_dim,) or (d_model,)
+    ffn_bias: ShardingSpec  # (ffn_dim,) or (d_model,)
 
     # LayerNorm/GroupNorm sharding
-    norm_scale: ShardingSpec      # (dim,)
-    norm_bias: ShardingSpec       # (dim,)
+    norm_scale: ShardingSpec  # (dim,)
+    norm_bias: ShardingSpec  # (dim,)
 
     # Quantizer codebook sharding
-    codebook: ShardingSpec        # (codebook_size, d_model)
+    codebook: ShardingSpec  # (codebook_size, d_model)
 
     # ConvTranspose1d权重 sharding
     conv_transpose_weight: ShardingSpec  # (in_ch, out_ch, kernel)
-    conv_transpose_bias: ShardingSpec    # (out_ch,)
+    conv_transpose_bias: ShardingSpec  # (out_ch,)
 
     # ISTFT相关 sharding
     istft_linear_weight: ShardingSpec  # (dim, n_fft+2)
-    istft_linear_bias: ShardingSpec    # (n_fft+2,)
-    istft_window: ShardingSpec         # (win_length,)
+    istft_linear_bias: ShardingSpec  # (n_fft+2,)
+    istft_window: ShardingSpec  # (win_length,)
 
     # 激活值 sharding
-    act_btd: ShardingSpec         # [batch, time, d_model]
-    act_btnh: ShardingSpec        # [batch, time, num_heads, head_dim]
-    act_btc: ShardingSpec         # [batch, time, channels]
+    act_btd: ShardingSpec  # [batch, time, d_model]
+    act_btnh: ShardingSpec  # [batch, time, num_heads, head_dim]
+    act_btc: ShardingSpec  # [batch, time, channels]
 
     @staticmethod
     def no_sharding():
@@ -262,20 +259,6 @@ class VocoderOutput:
     wav_lengths: Array
 
 
-@dataclass
-class StreamingConfig:
-    seg_point: int = field(default=60 * 25)
-    process_seg_point: bool = field(default=True)
-    left_overlap: int = field(default=10 * 25)
-    right_overlap: int = field(default=40)
-    seg_point_left_overlap: int = field(default=0)
-
-
-@dataclass
-class StreamingCache:
-    hidden_states: Optional[List[Array]] = None
-    processed_lengths: Optional[List[int]] = None
-
 class MelSpectrogram:
     """Mel spectrogram computation for audio processing."""
 
@@ -322,7 +305,7 @@ class MelSpectrogram:
             self.sample_rate / 2,
             self.n_fft // 2 + 1,
             dtype=jnp.float32,
-            )
+        )
         mel_min = self._hz_to_mel(self.f_min)
         mel_max = self._hz_to_mel(self.f_max)
         mel_points = jnp.linspace(mel_min, mel_max, self.n_mels + 2)
@@ -363,7 +346,7 @@ class MelSpectrogram:
 
         starts = [idx * self.hop_length for idx in range(num_frames)]
         frames = jnp.stack(
-            [waveform[start : start + frame_length] for start in starts], axis=0
+            [waveform[start: start + frame_length] for start in starts], axis=0
         )
         return frames
 
@@ -407,6 +390,7 @@ class MelSpectrogram:
         if squeeze_dim:
             mel_stack = jnp.squeeze(mel_stack, axis=0)
         return mel_stack
+
 
 class RotaryEmbedding(nnx.Module):
     def __init__(self, base: float, dim: int, max_seq_len: int, rope_type: str = "default", dtype=jnp.float32):
@@ -539,7 +523,7 @@ class ISTFTHead(nnx.Module):
 
         # Pass shd_cfg to ISTFT
         self.istft = ISTFT(n_fft=n_fft, hop_length=hop_length, win_length=n_fft,
-                          padding=padding, shd_cfg=self.shd_cfg, dtype=dtype)
+                           padding=padding, shd_cfg=self.shd_cfg, dtype=dtype)
 
     def __call__(self, hidden_states: Array) -> Array:
         x = self.linear(hidden_states)
@@ -878,12 +862,12 @@ class CausalConvTranspose1d(nnx.Module):
 
         # Pass shd_cfg to ConvTranspose1d
         self.conv = ConvTranspose1d(in_channels, out_channels, kernel_size, stride,
-                                   shd_cfg=self.shd_cfg, dtype=dtype, rngs=rngs)
+                                    shd_cfg=self.shd_cfg, dtype=dtype, rngs=rngs)
 
         # Apply sharding to GroupNorm
         self.norm = shard(
             nnx.GroupNorm(num_features=out_channels, num_groups=1, epsilon=1e-5,
-                         param_dtype=dtype, rngs=rngs),
+                          param_dtype=dtype, rngs=rngs),
             self.shd_cfg.norm_scale
         )
 
@@ -933,8 +917,8 @@ class TransformerVocos(nnx.Module):
 
         # Pass shd_cfg to ISTFTHead
         self.head = ISTFTHead(config.vocoder_dim, config.nfft, config.hop_length,
-                             config.vocoder_padding, shd_cfg=self.shd_cfg,
-                             dtype=dtype, rngs=rngs)
+                              config.vocoder_padding, shd_cfg=self.shd_cfg,
+                              dtype=dtype, rngs=rngs)
 
     def __call__(self, mels: Array, input_length: Array) -> VocoderOutput:
         x = self.embeddings(mels)

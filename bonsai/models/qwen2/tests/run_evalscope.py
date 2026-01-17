@@ -36,6 +36,7 @@ def run_evaluation(
     datasets: list[str] = None,
     limit: int = 10,
     output_dir: str = "./eval_results",
+    few_shot_num: int = 5,
 ):
     """Run evalscope evaluation."""
     if datasets is None:
@@ -46,11 +47,32 @@ def run_evaluation(
     print(f"  Base URL: {base_url}")
     print(f"  Datasets: {', '.join(datasets)}")
     print(f"  Sample limit: {limit}")
+    print(f"  Few-shot examples: {few_shot_num}")
     print(f"  Output directory: {output_dir}")
     print(f"{'='*60}\n")
 
     # Create output directory
     Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Generation config for optimal GSM8K performance
+    # - temperature=0.0: Greedy decoding for deterministic reasoning
+    # - top_p=0.9: Nucleus sampling (though not used with temp=0)
+    # - max_tokens=2048: Sufficient for complex math problems
+    # - use_chat_template=false: Preserve few-shot format
+    generation_config = {
+        "temperature": 0.0,
+        "top_p": 0.9,
+        "max_tokens": 2048,
+        "use_chat_template": False,
+    }
+
+    # Dataset-specific args: configure few-shot learning
+    dataset_args = {}
+    for dataset in datasets:
+        dataset_args[dataset] = {
+            "few_shot_num": few_shot_num,
+            "few_shot_random": False,  # Use fixed examples for reproducibility
+        }
 
     # Build evalscope command
     cmd = [
@@ -60,6 +82,8 @@ def run_evaluation(
         "--limit", str(limit),
         "--work-dir", output_dir,
         "--api-url", f"{base_url}/v1/chat/completions",
+        "--generation-config", str(generation_config).replace("'", '"'),
+        "--dataset-args", str(dataset_args).replace("'", '"'),
     ]
 
     print(f"Running command: {' '.join(cmd)}\n")
@@ -88,6 +112,8 @@ def main():
                         help="Comma-separated list of datasets (e.g., ceval,mmlu)")
     parser.add_argument("--limit", type=int, default=1,
                         help="Number of samples to evaluate per dataset")
+    parser.add_argument("--few-shot-num", type=int, default=5,
+                        help="Number of few-shot examples (default: 5, matching Qwen2 official)")
     parser.add_argument("--output-dir", type=str, default="./eval_results",
                         help="Directory to save evaluation results")
     parser.add_argument("--start-server", action="store_true",
@@ -141,6 +167,7 @@ def main():
             datasets=datasets,
             limit=args.limit,
             output_dir=args.output_dir,
+            few_shot_num=args.few_shot_num,
         )
 
         sys.exit(0 if success else 1)

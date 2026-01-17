@@ -149,7 +149,7 @@ class EndToEndTester:
         try:
             # Create dummy mel spectrogram input
             batch_size = 2
-            mel_len = 100
+            mel_len = 200
             n_mels = self.tokenizer_config.n_mels
 
             self._print(f"创建虚拟输入: batch={batch_size}, mel_len={mel_len}, n_mels={n_mels}")
@@ -971,13 +971,24 @@ class EndToEndTester:
 
             # 文本通道：使用TTS prompt格式（关键！）
             if text_tokenizer:
-                text_to_speak = "床前明月光，疑是地上霜，举头望明月，低头思故乡。"  # 使用简短文本
-                # text_to_speak = "在那边，在大海的那一头，老人正睡在自己的棚子里。他依然脸朝下睡着，孩子坐在他身边守着他。老人正梦见狮子。一个人并不是生来要给打败的。你尽可以把他消灭掉，可就是打不败他。"
-                tts_template = "请将这段文字转换为语音，使用沉稳的男性音色，富有力量感"
+                # text_to_speak = "床前明月光，疑是地上霜。举头望明月，低头思故乡。"  # 使用简短文本
+                text_to_speak = "在那边，在大海的那一头，老人正睡在自己的棚子里。他依然脸朝下睡着，孩子坐在他身边守着他，老人正梦见狮子。一个人并不是生来要给打败的，你尽可以把他消灭掉，可就是打不败他。"
+
+                # ✅ 使用官方推荐的标准TTS模板（见 templates.py:30-41）
+                tts_template = "请将这段文字转换为语音"  # 官方推荐，列表第一个
+                # 其他官方模板选项：
+                # tts_template = "帮我把这个文本读出来"
+                # tts_template = "请朗读这段内容"
+                # tts_template = "帮我朗读这段文字"
+                # tts_template = ""  # 无模板模式
 
                 # 官方TTS格式：
                 # <|im_start|>user\n{template}: {text}<|im_end|>\n<|im_start|>assistant\n<|sostm|>
-                chat_text = f"<|im_start|>user\n{tts_template}: {text_to_speak}<|im_end|>\n<|im_start|>assistant\n<|sostm|>"
+                if tts_template:
+                    chat_text = f"<|im_start|>user\n{tts_template}: {text_to_speak}<|im_end|>\n<|im_start|>assistant\n<|sostm|>"
+                else:
+                    # 无模板模式
+                    chat_text = f"<|im_start|>user\n{text_to_speak}<|im_end|>\n<|im_start|>assistant\n<|sostm|>"
 
                 # 1. 首先tokenize文本（不限制长度）
                 text_tokens_raw = text_tokenizer.encode(chat_text)
@@ -1041,7 +1052,7 @@ class EndToEndTester:
             self._print(f"文本 pad_id: {text_tokenizer.pad_token_id if text_tokenizer else 0}")
 
             # 初始化 cache
-            generate_steps = 100  # 增加到30步，生成更长的序列
+            generate_steps = 200  # 增加到30步，生成更长的序列
             cache = self.main_model.model.init_cache(
                 self.main_model.qwen2_config,
                 batch_size,
@@ -1074,8 +1085,8 @@ class EndToEndTester:
 
             # 创建 sampler（使用官方推荐参数）
             from bonsai.models.mimo_audio.modeling import MiMoSampler, MiMoSamplerConfig
-            text_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.6, top_k=50, top_p=1.0, do_sample=True))
-            audio_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.9, top_k=50, top_p=0.95, do_sample=True))
+            text_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.6,  top_p=1.0, do_sample=True))
+            audio_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.9,  top_p=0.95, do_sample=True))
             # text_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.6, top_k=50, top_p=1.0, do_sample=False))
             # audio_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.9, top_k=50, top_p=0.95, do_sample=False))
 
@@ -1083,6 +1094,14 @@ class EndToEndTester:
             rng_key = jax.random.key(42)
 
             for step in range(generate_steps):
+                # ============================================================
+                # 诊断策略：追踪为什么音频后半段是无意义的语音
+                # 1. 追踪连续的EMPTY token数量（EMPTY→生成音频）
+                # 2. 每10步显示token类型和是否生成音频
+                # 3. 每20步显示模型置信度，特别是EOSTM的概率
+                # 4. 检查是否正常生成EOSTM停止，还是达到max_steps
+                # ============================================================
+
                 # 调试：打印logits统计（仅第一步）
                 if step == 0:
                     self._print(f"\n调试信息（第1步）：")
@@ -1102,6 +1121,18 @@ class EndToEndTester:
                 next_text_token_int = int(next_text_token[0])
                 generated_text_tokens.append(next_text_token_int)
 
+                # 诊断：每20步显示模型对当前token的置信度
+                if step % 20 == 0:
+                    probs = jax.nn.softmax(text_logits[0, 0, :].astype(jnp.float32))
+                    top5_indices = jnp.argsort(probs)[-5:][::-1]
+                    top5_probs = probs[top5_indices]
+                    self._print(f"\n  [步骤 {step + 1} 模型置信度]")
+                    self._print(f"    选中token: {next_text_token_int} (概率={float(probs[next_text_token_int]):.4f})")
+                    eostm_idx = self.main_model.args.eostm_idx
+                    eostm_prob = float(probs[eostm_idx])
+                    self._print(f"    EOSTM({eostm_idx})概率: {eostm_prob:.4f}")
+
+
                 # 统计token类型
                 empty_idx = self.main_model.args.empty_idx
                 if next_text_token_int == empty_idx:
@@ -1111,6 +1142,28 @@ class EndToEndTester:
                     pass  # 停止token，不计数
                 else:
                     num_text_token_generated += 1
+
+                # 每步都检查并打印（诊断用）
+                token_type = "EOSTM" if next_text_token_int == self.main_model.args.eostm_idx else \
+                            "EMPTY" if next_text_token_int == empty_idx else \
+                            "EOS" if (text_tokenizer and next_text_token_int == text_tokenizer.eos_token_id) else \
+                            "TEXT"
+
+                # 跟踪连续的empty token数量
+                if token_type == "EMPTY":
+                    if not hasattr(self, '_consecutive_empty_count'):
+                        self._consecutive_empty_count = 0
+                    self._consecutive_empty_count += 1
+                else:
+                    if hasattr(self, '_consecutive_empty_count'):
+                        if self._consecutive_empty_count > 0:
+                            self._print(f"  [连续生成了 {self._consecutive_empty_count} 个EMPTY token]")
+                    self._consecutive_empty_count = 0
+
+                # 每10步或遇到特殊token时打印
+                if step % 10 == 0 or token_type in ["EOSTM", "EOS"]:
+                    audio_info = "→生成音频" if token_type == "EMPTY" else "→无音频"
+                    self._print(f"  步骤 {step + 1}: token={next_text_token_int} ({token_type}) {audio_info}")
 
                 # 检查是否生成了停止token（EOSTM或EOS）
                 if next_text_token_int == self.main_model.args.eostm_idx:
@@ -1179,17 +1232,14 @@ class EndToEndTester:
                     self.main_model, next_input, cache, pad_id
                 )
 
-                if step % 2 == 0:
-                    # 显示生成进度
-                    if audio_tokens is not None:
-                        # 显示生成的音频的第一个时间步
-                        sample_tokens = audio_tokens[0, 0, :3]
-                        self._print(f"  步骤 {step + 1}/{generate_steps}: 生成文本 token {next_text_token_int}, 音频 tokens (时间步0) {sample_tokens}...")
-                    else:
-                        self._print(f"  步骤 {step + 1}/{generate_steps}: 生成文本 token {next_text_token_int}, 未生成音频（使用empty_ids）")
-
             inference_time = time.time() - start_time
             self._print(f"\n推理完成，总耗时: {inference_time:.3f}秒")
+
+            # 诊断信息：检查是否正常停止
+            if hasattr(self, '_consecutive_empty_count') and self._consecutive_empty_count > 0:
+                self._print(f"  [最后连续生成了 {self._consecutive_empty_count} 个EMPTY token]")
+            if step + 1 >= generate_steps:
+                self._print(f"  ⚠️  达到最大步数 {generate_steps}，可能没有生成EOSTM token")
 
             # 统计报告
             self._print("\n" + "=" * 70)

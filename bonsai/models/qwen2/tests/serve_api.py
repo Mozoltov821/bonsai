@@ -38,20 +38,20 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
-    temperature: float = 1.0
-    top_p: float = 0.8
-    top_k: int = 10
+    temperature: float = 0.0  # Use greedy decoding for deterministic evaluation
+    top_p: float = 0.9
+    top_k: int = 20
     max_tokens: int = 2048
     stream: bool = False
-    use_chat_template: bool = True  # Default to False for evaluation tasks
+    use_chat_template: bool = False  # Default to False for evaluation tasks (preserves few-shot format)
 
 
 class CompletionRequest(BaseModel):
     model: str
     prompt: str | list[str]
-    temperature: float = 1.0
-    top_p: float = 0.8
-    top_k: int = 10
+    temperature: float = 0.0  # Use greedy decoding for deterministic evaluation
+    top_p: float = 0.9
+    top_k: int = 20
     max_tokens: int = 2048
 
 
