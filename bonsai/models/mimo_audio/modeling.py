@@ -19,6 +19,7 @@ class MiMoAudioConfig:
     num_key_value_heads: int = 2
     intermediate_size: int = 8960
     max_position_embeddings: int = 32768
+    rope_theta: int = 10000  # RoPE 基础频率
 
     # MiMo-specific config
     speech_vocab_size: str | int = "1025-1025-129-129-129-129-129-129"
@@ -246,7 +247,7 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
             num_heads=config.num_attention_heads,
             head_dim=config.head_dim,
             num_kv_heads=config.num_key_value_heads,
-            rope_theta=10000,
+            rope_theta=config.rope_theta,  # 从配置读取
             norm_eps=1e-6,
             tie_word_embeddings=False,
             shd_cfg=config.shd_cfg,
@@ -262,7 +263,7 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
             num_heads=config.local_attn_heads,
             head_dim=config.local_dim // config.local_attn_heads,
             num_kv_heads=config.local_attn_heads,
-            rope_theta=10000,
+            rope_theta=config.rope_theta,  # 从配置读取
             norm_eps=1e-6,
             tie_word_embeddings=False,
             shd_cfg=config.shd_cfg,
@@ -283,7 +284,7 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
             num_heads=config.local_attn_heads,
             head_dim=config.input_local_dim // config.local_attn_heads,
             num_kv_heads=config.local_attn_heads,
-            rope_theta=10000,
+            rope_theta=config.rope_theta,  # 从配置读取
             norm_eps=1e-6,
             tie_word_embeddings=False,
             use_causal_mask=use_causal_mask,
