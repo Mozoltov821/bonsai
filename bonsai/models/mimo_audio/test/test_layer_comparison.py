@@ -349,31 +349,90 @@ class ModelLoader:
         return model, config, args
 
     def verify_weight_consistency(self, jax_model, torch_model) -> bool:
-        """验证权重一致性"""
-        print("  检查嵌入层权重...")
+        """验证所有层的权重一致性"""
+        print("  验证所有层权重一致性...")
 
-        # 比较文本嵌入 - 使用新的 API
+        all_consistent = True
+        tolerance = 1e-5
+
+        # 1. 文本嵌入层
+        print("  [1/5] 检查文本嵌入层...")
         jax_text_emb = np.array(jax_model.model.embedder.embedding[...])
         torch_text_emb = torch_model.model.embed_tokens.weight.detach().cpu().float().numpy()
-
         diff = np.abs(jax_text_emb - torch_text_emb).max()
-        if diff > 1e-5:
-            print(f"  ⚠ 文本嵌入权重不一致: max_diff={diff:.6f}")
-            return False
+        if diff > tolerance:
+            print(f"    ❌ 文本嵌入权重不一致: max_diff={diff:.6f}")
+            all_consistent = False
+        else:
+            print(f"    ✅ 文本嵌入一致 (diff={diff:.6e})")
 
-        print("  检查第一层注意力权重...")
-        # 比较第一层的 Q 权重 - 使用 q_proj 而不是 wq
-        jax_q = np.array(jax_model.model.layers[0].attn.q_proj.kernel[...])
-        torch_q = torch_model.model.layers[0].self_attn.q_proj.weight.detach().cpu().float().numpy()
+        # 2. 语音嵌入层（8个通道）
+        print("  [2/5] 检查语音嵌入层 (8 通道)...")
+        for ch in range(8):
+            jax_speech_emb = np.array(jax_model.model.speech_embeddings[ch].embedding[...])
+            torch_speech_emb = torch_model.model.speech_embeddings[ch].weight.detach().cpu().float().numpy()
+            diff = np.abs(jax_speech_emb - torch_speech_emb).max()
+            if diff > tolerance:
+                print(f"    ❌ 通道 {ch} 不一致: max_diff={diff:.6f}")
+                all_consistent = False
+        print(f"    ✅ 所有语音嵌入一致")
 
-        diff = np.abs(jax_q.T - torch_q).max()  # JAX 使用转置
-        if diff > 1e-5:
-            print(f"  ⚠ 第一层 Q 权重不一致: max_diff={diff:.6f}")
-            return False
+        # 3. Input Local Transformer（6层）
+        print("  [3/5] 检查 Input Local Transformer (6 层)...")
+        num_input_local_layers = len(jax_model.input_local_transformer.layers)
+        for i in range(num_input_local_layers):
+            # Q/K/V 投影
+            for proj_name in ['q_proj', 'k_proj', 'v_proj']:
+                jax_weight = np.array(getattr(jax_model.input_local_transformer.layers[i].attn, proj_name).kernel[...])
+                torch_weight = getattr(torch_model.input_local_transformer.layers[i].self_attn, proj_name).weight.detach().cpu().float().numpy()
+                diff = np.abs(jax_weight.T - torch_weight).max()
+                if diff > tolerance:
+                    print(f"    ❌ 层 {i} {proj_name} 不一致: max_diff={diff:.6f}")
+                    all_consistent = False
+        print(f"    ✅ Input Local Transformer 一致")
 
-        print("  ✅ 嵌入层权重一致")
-        print("  ✅ 第一层注意力权重一致")
-        return True
+        # 4. Main Transformer（36层）
+        print("  [4/5] 检查 Main Transformer (36 层)...")
+        num_main_layers = len(jax_model.model.layers)
+        for i in range(num_main_layers):
+            # Q/K/V 投影
+            for proj_name in ['q_proj', 'k_proj', 'v_proj']:
+                jax_weight = np.array(getattr(jax_model.model.layers[i].attn, proj_name).kernel[...])
+                torch_weight = getattr(torch_model.model.layers[i].self_attn, proj_name).weight.detach().cpu().float().numpy()
+                diff = np.abs(jax_weight.T - torch_weight).max()
+                if diff > tolerance:
+                    print(f"    ❌ 层 {i} {proj_name} 不一致: max_diff={diff:.6f}")
+                    all_consistent = False
+
+            # MLP 权重
+            jax_gate = np.array(jax_model.model.layers[i].mlp.gate_proj.kernel[...])
+            torch_gate = torch_model.model.layers[i].mlp.gate_proj.weight.detach().cpu().float().numpy()
+            diff = np.abs(jax_gate.T - torch_gate).max()
+            if diff > tolerance:
+                print(f"    ❌ 层 {i} gate_proj 不一致: max_diff={diff:.6f}")
+                all_consistent = False
+        print(f"    ✅ Main Transformer 一致")
+
+        # 5. Local Transformer（16层）
+        print("  [5/5] 检查 Local Transformer (16 层)...")
+        num_local_layers = len(jax_model.local_transformer.layers)
+        for i in range(num_local_layers):
+            # Q/K/V 投影
+            for proj_name in ['q_proj', 'k_proj', 'v_proj']:
+                jax_weight = np.array(getattr(jax_model.local_transformer.layers[i].attn, proj_name).kernel[...])
+                torch_weight = getattr(torch_model.local_transformer.layers[i].self_attn, proj_name).weight.detach().cpu().float().numpy()
+                diff = np.abs(jax_weight.T - torch_weight).max()
+                if diff > tolerance:
+                    print(f"    ❌ 层 {i} {proj_name} 不一致: max_diff={diff:.6f}")
+                    all_consistent = False
+        print(f"    ✅ Local Transformer 一致")
+
+        if all_consistent:
+            print("\n  ✅ 所有层权重验证通过")
+        else:
+            print("\n  ❌ 部分权重不一致")
+
+        return all_consistent
 
     def compare_configs(self, jax_config, torch_config) -> bool:
         """比对两个配置是否一致"""
