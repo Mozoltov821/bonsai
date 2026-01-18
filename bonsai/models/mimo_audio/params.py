@@ -8,7 +8,7 @@ from flax import nnx
 from bonsai.models.qwen2.params import Transform, TRANSFORM_LINEAR, TRANSFORM_NONE, _stoi, _assign_weights
 
 
-def _get_qwen2_key_mapping(prefix: str, num_heads: int, num_kv_heads: int, emb_dim: int, head_dim: int) -> dict[str, tuple[str, Transform]]:
+def _get_qwen2_key_mapping(prefix: str) -> dict[str, tuple[str, Transform]]:
     q_bias_flatten = Transform(reshape=(-1,))
     kv_bias_flatten = Transform(reshape=(-1,))
 
@@ -106,31 +106,13 @@ def create_model_with_weights(
     full_mapping = {}
 
     # Main model mapping (model prefix)
-    full_mapping.update(_get_qwen2_key_mapping(
-        "model",
-        num_heads=config.num_attention_heads,
-        num_kv_heads=config.num_key_value_heads,
-        emb_dim=config.hidden_size,
-        head_dim=config.head_dim,
-    ))
+    full_mapping.update(_get_qwen2_key_mapping("model"))
 
     # Local transformer mapping
-    full_mapping.update(_get_qwen2_key_mapping(
-        "local_transformer",
-        num_heads=config.local_attn_heads,
-        num_kv_heads=config.local_attn_heads,
-        emb_dim=config.local_dim,
-        head_dim=config.local_dim // config.local_attn_heads,
-    ))
+    full_mapping.update(_get_qwen2_key_mapping("local_transformer"))
 
     # Input local transformer mapping
-    full_mapping.update(_get_qwen2_key_mapping(
-        "input_local_transformer",
-        num_heads=config.local_attn_heads,
-        num_kv_heads=config.local_attn_heads,
-        emb_dim=config.input_local_dim,
-        head_dim=config.input_local_dim // config.local_attn_heads,
-    ))
+    full_mapping.update(_get_qwen2_key_mapping("input_local_transformer"))
 
     full_mapping.update(_get_mimo_key_mapping(config.audio_channels))
 
