@@ -64,10 +64,10 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         self.args = args
         self.shd_cfg = config.shd_cfg  # Store sharding config
 
-        # Parse speech configurations
-        self.speech_vocab_sizes = config.parsed_speech_vocab_sizes()
-        self.speech_empty_ids = config.parsed_speech_empty_ids()
-        self.delay_pattern = config.parsed_delay_pattern()
+        # Fixed speech configurations (based on actual model)
+        self.speech_vocab_sizes = [1025, 1025, 129, 129, 129, 129, 129, 129]
+        self.speech_empty_ids = [1024, 1024, 128, 128, 128, 128, 128, 128]
+        self.delay_pattern = [0, 1, 2, 3, 4, 5, 6, 7]
 
         self.group_size = config.group_size
         self.audio_channels = config.audio_channels

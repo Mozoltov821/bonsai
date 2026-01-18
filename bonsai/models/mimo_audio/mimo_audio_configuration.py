@@ -2,7 +2,7 @@
 MiMo Audio 模型配置类
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List, TYPE_CHECKING
 from bonsai.models.qwen3.modeling import ShardingCfg
 
@@ -23,7 +23,7 @@ class MiMoAudioConfig:
     max_position_embeddings: int = 32768
     rope_theta: int = 10000  # RoPE 基础频率
 
-    # MiMo-specific config
+    # MiMo-specific config (保留用于向后兼容)
     speech_vocab_size: str | int = "1025-1025-129-129-129-129-129-129"
     speech_zeroemb_idx: str | int = "1024-1024-128-128-128-128-128-128"
     delay_pattern: str = "0-1-2-3-4-5-6-7"
@@ -55,20 +55,6 @@ class MiMoAudioConfig:
         """Create config with default sharding enabled"""
         kwargs['shd_cfg'] = ShardingCfg.default()
         return cls(**kwargs)
-
-    def _parse_maybe_list(self, value: str | int, length: int) -> List[int]:
-        if isinstance(value, str) and "-" in value:
-            return [int(s) for s in value.split("-")]
-        return [int(value)] * length
-
-    def parsed_speech_empty_ids(self) -> List[int]:
-        return self._parse_maybe_list(self.speech_zeroemb_idx, self.audio_channels)
-
-    def parsed_speech_vocab_sizes(self) -> List[int]:
-        return self._parse_maybe_list(self.speech_vocab_size, self.audio_channels)
-
-    def parsed_delay_pattern(self) -> List[int]:
-        return self._parse_maybe_list(self.delay_pattern, self.audio_channels)
 
     def create_qwen2_config(self) -> "Qwen2Config":
         """Create Qwen2 config for main transformer from MiMo config"""
