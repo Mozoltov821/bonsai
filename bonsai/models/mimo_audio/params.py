@@ -39,7 +39,6 @@ def _get_mimo_key_mapping(audio_channels: int) -> dict[str, tuple[str, Transform
         r"lm_head\.weight": ("lm_head.kernel", TRANSFORM_LINEAR),
         r"hidden_states_downcast\.weight": ("hidden_states_downcast.kernel", TRANSFORM_LINEAR),
         r"speech_group_downcast\.weight": ("speech_group_downcast.kernel", TRANSFORM_LINEAR),
-        r"speech_embeddings_to_local\.weight": ("speech_embeddings_to_local.kernel", TRANSFORM_LINEAR),
     }
 
     for i in range(audio_channels):

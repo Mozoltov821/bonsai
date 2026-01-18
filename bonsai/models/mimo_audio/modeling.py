@@ -222,7 +222,7 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
             input_ids: jnp.ndarray,
             cache: Cache,
             pad_id: int = 0,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, Cache]:
         """Forward pass through the model"""
         text_input_ids = input_ids[:, 0, ::self.group_size]
 
@@ -250,7 +250,7 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
             hidden_states[:, -1:, :]
         )  # [B, 1, local_dim]
 
-        return text_logits, local_hidden_states
+        return text_logits, local_hidden_states, cache
 
     def local_forward(
             self,
@@ -378,7 +378,7 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
             ).transpose(0, 2, 1).reshape(B, self.audio_channels + 1, -1)
 
             # Forward pass with cache
-            text_logits, local_hidden_states = self.forward(
+            text_logits, local_hidden_states, main_cache = self.forward(
                 model_input_ids,
                 main_cache,
                 pad_id=pad_id
@@ -496,7 +496,7 @@ def forward_jit(
         local_hidden_states: [B, 1, local_dim]
         cache: Updated cache (for JAX tracing)
     """
-    text_logits, local_hidden_states = model.forward(input_ids, cache, pad_id)
+    text_logits, local_hidden_states, cache = model.forward(input_ids, cache, pad_id)
     return text_logits, local_hidden_states, cache
 
 
