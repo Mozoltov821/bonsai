@@ -613,8 +613,8 @@ class JAXLayerCapture:
         x = self.model.model.final_norm(x)
         self.capture('final_norm_output', x)
 
-        # 8. 文本 logits
-        text_logits = self.model.model.lm_head(x[:, -1:, :])
+        # 8. Text logits
+        text_logits = self.model.lm_head(x[:, -1:, :])
         self.capture('text_logits', text_logits)
 
         # 9. Local transformer 准备

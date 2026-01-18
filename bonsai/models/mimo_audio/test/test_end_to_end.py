@@ -94,7 +94,7 @@ class EndToEndTester:
             with open(config_path) as f:
                 config_dict = json.load(f)
 
-            from bonsai.models.mimo_audio.mimo_audio_tokenizer import MiMoAudioTokenizerConfig
+            from bonsai.models.mimo_audio.mimo_audio_tokenizer_configuration import MiMoAudioTokenizerConfig
             from bonsai.models.mimo_audio.mimo_audio_tokenizer_params import load_tokenizer_weights_from_safetensors
 
             # ✅ 禁用 sharding 以提升单卡推理速度（避免多卡通信开销）
