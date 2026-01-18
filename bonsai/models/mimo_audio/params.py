@@ -1,4 +1,3 @@
-import gc
 import re
 from typing import Any
 
@@ -80,18 +79,14 @@ def create_model_with_weights(
 
     print("Creating MiMo Audio model with weights...")
 
-    # Import here to avoid circular dependency
     from bonsai.models.mimo_audio.modeling import FlaxMiMoAudioForCausalLM
 
-    # Create model with eval_shape (memory efficient)
     model = nnx.eval_shape(lambda: FlaxMiMoAudioForCausalLM(config, args, nnx.Rngs(0), dtype=dtype))
     graph_def, abs_state = nnx.split(model)
     pure_state_dict = abs_state.to_pure_dict()
 
-    # Get sharding dict if mesh provided
     sharding = nnx.get_named_sharding(abs_state, mesh).to_pure_dict() if mesh is not None else None
 
-    # Load safetensors
     index_path = os.path.join(model_path, "model.safetensors.index.json")
     state_dict = {}
 
@@ -108,7 +103,6 @@ def create_model_with_weights(
             for key in f.keys():
                 state_dict[key] = f.get_tensor(key)
 
-    # Build key mapping
     full_mapping = {}
 
     # Main model mapping (model prefix)
@@ -154,7 +148,6 @@ def create_model_with_weights(
             _assign_weights(keys, tensor_jax, pure_state_dict, torch_key, transform, sharding)
             loaded_count += 1
         except KeyError as e:
-            # Skip weights for modules that are set to None (e.g., embedder)
             continue
         except Exception as e:
             full_jax_key = ".".join([str(k) for k in keys])
@@ -166,7 +159,6 @@ def create_model_with_weights(
         )
 
     model = nnx.merge(graph_def, pure_state_dict)
-    gc.collect()
 
     print(f"MiMo Audio model created successfully! ({loaded_count} parameters loaded)")
     return model
