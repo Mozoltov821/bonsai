@@ -381,7 +381,7 @@ class EndToEndTester:
                 self._print("Skipping main model tests", "WARNING")
                 return False
 
-            from bonsai.models.mimo_audio.modeling import MiMoAudioConfig, MiMoAudioArguments
+            from bonsai.models.mimo_audio.mimo_audio_configuration import MiMoAudioConfig, MiMoAudioArguments
             from bonsai.models.mimo_audio.params import create_model_with_weights
 
             # Load config
@@ -973,9 +973,9 @@ class EndToEndTester:
             if text_tokenizer:
                 # text_to_speak = "床前明月光，疑是地上霜。举头望明月，低头思故乡。"  # 使用简短文本
                 text_to_speak = "在那边，在大海的那一头，老人正睡在自己的棚子里。他依然脸朝下睡着，孩子坐在他身边守着他，老人正梦见狮子。一个人并不是生来要给打败的，你尽可以把他消灭掉，可就是打不败他。"
-
                 # ✅ 使用官方推荐的标准TTS模板（见 templates.py:30-41）
-                tts_template = "请将这段文字转换为语音"  # 官方推荐，列表第一个
+                # tts_template = "请将这段文字转换为语音"  # 官方推荐，列表第一个
+                tts_template = "请将这段文字转换为语音，使用沉稳厚重的男性音色。"  # 官方推荐，列表第一个
                 # 其他官方模板选项：
                 # tts_template = "帮我把这个文本读出来"
                 # tts_template = "请朗读这段内容"
@@ -1052,7 +1052,7 @@ class EndToEndTester:
             self._print(f"文本 pad_id: {text_tokenizer.pad_token_id if text_tokenizer else 0}")
 
             # 初始化 cache
-            generate_steps = 200  # 增加到30步，生成更长的序列
+            generate_steps = 1000  # 增加到30步，生成更长的序列
             cache = self.main_model.model.init_cache(
                 self.main_model.qwen2_config,
                 batch_size,
@@ -1084,7 +1084,8 @@ class EndToEndTester:
             num_text_token_generated = 0  # 生成了多少个文本token
 
             # 创建 sampler（使用官方推荐参数）
-            from bonsai.models.mimo_audio.modeling import MiMoSampler, MiMoSamplerConfig
+            from bonsai.models.mimo_audio.modeling import MiMoSampler
+            from bonsai.models.mimo_audio.mimo_audio_configuration import MiMoSamplerConfig
             text_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.6,  top_p=1.0, do_sample=True))
             audio_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.9,  top_p=0.95, do_sample=True))
             # text_sampler = MiMoSampler(MiMoSamplerConfig(temperature=0.6, top_k=50, top_p=1.0, do_sample=False))

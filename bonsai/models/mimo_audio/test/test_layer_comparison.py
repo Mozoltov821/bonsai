@@ -244,7 +244,7 @@ class ModelLoader:
     def load_jax_model(self):
         """加载 JAX 模型"""
         from bonsai.models.mimo_audio.params import create_model_with_weights
-        from bonsai.models.mimo_audio.modeling import MiMoAudioConfig, MiMoAudioArguments
+        from bonsai.models.mimo_audio.mimo_audio_configuration import MiMoAudioConfig, MiMoAudioArguments
 
         # 加载配置
         config_path = os.path.join(self.model_path, "config.json")
@@ -369,8 +369,8 @@ class ModelLoader:
         # 2. 语音嵌入层（8个通道）
         print("  [2/5] 检查语音嵌入层 (8 通道)...")
         for ch in range(8):
-            jax_speech_emb = np.array(jax_model.model.speech_embeddings[ch].embedding[...])
-            torch_speech_emb = torch_model.model.speech_embeddings[ch].weight.detach().cpu().float().numpy()
+            jax_speech_emb = np.array(jax_model.speech_embeddings[ch].embedding[...])
+            torch_speech_emb = torch_model.speech_embeddings[ch].weight.detach().cpu().float().numpy()
             diff = np.abs(jax_speech_emb - torch_speech_emb).max()
             if diff > tolerance:
                 print(f"    ❌ 通道 {ch} 不一致: max_diff={diff:.6f}")
@@ -447,7 +447,7 @@ class ModelLoader:
             'intermediate_size', 'max_position_embeddings',
             'rope_theta', 'head_dim', 'group_size', 'audio_channels',
             'local_dim', 'local_layers', 'local_attn_heads',
-            'local_ffn_dim', 'input_local_layers', 'input_local_dim',
+            'local_ffn_dim', 'local_attn_dropout', 'input_local_layers', 'input_local_dim',
             'input_full_attention', 'speech_vocab_size',
             'speech_zeroemb_idx', 'delay_pattern'
         ]
