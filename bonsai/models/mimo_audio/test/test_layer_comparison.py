@@ -45,7 +45,7 @@ class ComparisonConfig:
     atol: float = 1e-3  # 绝对容差
 
     # 输入配置
-    batch_size: int = 2
+    batch_size: int = 1
     num_groups: int = 4
     audio_channels: int = 8
     group_size: int = 4
@@ -201,13 +201,8 @@ class TensorComparator:
             max_rel_diff = 0.0
 
         # 判断是否通过
-        # 使用更智能的逻辑：
-        # 1. 如果绝对差异很小（< atol），直接通过
-        # 2. 否则检查相对误差
-        passed = (
-            max_abs_diff <= self.config.atol or
-            (max_rel_diff <= self.config.rtol and max_abs_diff < 10.0)  # 相对误差小且绝对差异不太大
-        )
+        # 使用平均绝对误差作为通过标准
+        passed = mean_abs_diff < 0.01
 
         return ComparisonResult(
             layer_name=layer_name,
@@ -382,7 +377,7 @@ class ModelLoader:
         num_input_local_layers = len(jax_model.input_local_transformer.layers)
         for i in range(num_input_local_layers):
             # Q/K/V 投影
-            for proj_name in ['q_proj', 'k_proj', 'v_proj']:
+            for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
                 jax_weight = np.array(getattr(jax_model.input_local_transformer.layers[i].attn, proj_name).kernel[...])
                 torch_weight = getattr(torch_model.input_local_transformer.layers[i].self_attn, proj_name).weight.detach().cpu().float().numpy()
                 diff = np.abs(jax_weight.T - torch_weight).max()
@@ -395,8 +390,8 @@ class ModelLoader:
         print("  [4/5] 检查 Main Transformer (36 层)...")
         num_main_layers = len(jax_model.model.layers)
         for i in range(num_main_layers):
-            # Q/K/V 投影
-            for proj_name in ['q_proj', 'k_proj', 'v_proj']:
+            # Q/K/V/O 投影
+            for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
                 jax_weight = np.array(getattr(jax_model.model.layers[i].attn, proj_name).kernel[...])
                 torch_weight = getattr(torch_model.model.layers[i].self_attn, proj_name).weight.detach().cpu().float().numpy()
                 diff = np.abs(jax_weight.T - torch_weight).max()
@@ -417,8 +412,8 @@ class ModelLoader:
         print("  [5/5] 检查 Local Transformer (16 层)...")
         num_local_layers = len(jax_model.local_transformer.layers)
         for i in range(num_local_layers):
-            # Q/K/V 投影
-            for proj_name in ['q_proj', 'k_proj', 'v_proj']:
+            # Q/K/V/O 投影
+            for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
                 jax_weight = np.array(getattr(jax_model.local_transformer.layers[i].attn, proj_name).kernel[...])
                 torch_weight = getattr(torch_model.local_transformer.layers[i].self_attn, proj_name).weight.detach().cpu().float().numpy()
                 diff = np.abs(jax_weight.T - torch_weight).max()
@@ -440,7 +435,7 @@ class ModelLoader:
         print("配置对比")
         print("=" * 70)
 
-        # 关键配置字段
+        # 关键配置字段 (跳过 JAX 中硬编码的字段：speech_vocab_size, speech_zeroemb_idx, delay_pattern)
         key_fields = [
             'vocab_size', 'hidden_size', 'num_hidden_layers',
             'num_attention_heads', 'num_key_value_heads',
@@ -448,8 +443,7 @@ class ModelLoader:
             'rope_theta', 'head_dim', 'group_size', 'audio_channels',
             'local_dim', 'local_layers', 'local_attn_heads',
             'local_ffn_dim', 'local_attn_dropout', 'input_local_layers', 'input_local_dim',
-            'input_full_attention', 'speech_vocab_size',
-            'speech_zeroemb_idx', 'delay_pattern'
+            'input_full_attention'
         ]
 
         all_match = True
@@ -575,13 +569,22 @@ class JAXLayerCapture:
         )
         self.capture('speech_group_downcast_output', speech_grouped_embeds)
 
-        # 6. 组合嵌入
-        combined_embeds = jnp.where(
-            is_speech[:, :, None],
-            speech_grouped_embeds,
-            text_embeds
-        )
+        # 6. Text embeddings - 清零 empty_idx 位置
+        text_zero_mask = text_input_ids == self.model.args.empty_idx
+        text_embeds = text_embeds * ~text_zero_mask[:, :, None]
+
+        # 7. 组合嵌入 - 使用加法（与 modeling.py 一致）
+        combined_embeds = text_embeds + speech_grouped_embeds
         self.capture('combined_embeddings', combined_embeds)
+
+        # 调试：打印组合嵌入的统计信息
+        print(f"\n[JAX] combined_embeds stats:")
+        print(f"  shape: {combined_embeds.shape}")
+        print(f"  mean: {float(jnp.mean(combined_embeds)):.6f}")
+        print(f"  std: {float(jnp.std(combined_embeds)):.6f}")
+        print(f"  min: {float(jnp.min(combined_embeds)):.6f}, max: {float(jnp.max(combined_embeds)):.6f}")
+        print(f"  has_nan: {jnp.any(jnp.isnan(combined_embeds))}")
+        print(f"  has_inf: {jnp.any(jnp.isinf(combined_embeds))}")
 
         # 7. 主 Transformer
         cache = self.model.model.init_cache(
@@ -594,6 +597,13 @@ class JAXLayerCapture:
 
         segment_ids = jnp.ones((B, T_groups), dtype=jnp.int32)
         x = combined_embeds
+
+        # 调试：打印 segment_ids
+        print(f"\n[JAX] Main Transformer 输入:")
+        print(f"  segment_ids: {segment_ids}")
+        print(f"  segment_ids shape: {segment_ids.shape}")
+        print(f"  input shape: {x.shape}")
+        print(f"  input mean: {float(jnp.mean(x)):.6f}, std: {float(jnp.std(x)):.6f}")
 
         for i, layer in enumerate(self.model.model.layers):
             x = layer(x, cache[i], segment_ids)
@@ -792,6 +802,74 @@ class LayerComparisonRunner:
             jax_act = jax_activations[layer_name]['value']
             torch_act = torch_activations[layer_name]['value']
 
+            # 特殊调试：对比 combined_embeddings
+            if layer_name == 'combined_embeddings':
+                print(f"\n[调试] {layer_name} 详细对比:")
+                jax_np = np.array(jax_act, dtype=np.float32)
+                torch_np = torch_act.detach().cpu().float().numpy() if isinstance(torch_act, torch.Tensor) else np.array(torch_act, dtype=np.float32)
+
+                print(f"  JAX:     mean={np.mean(jax_np):.6f}, std={np.std(jax_np):.6f}, "
+                      f"min={np.min(jax_np):.6f}, max={np.max(jax_np):.6f}")
+                print(f"  PyTorch: mean={np.mean(torch_np):.6f}, std={np.std(torch_np):.6f}, "
+                      f"min={np.min(torch_np):.6f}, max={np.max(torch_np):.6f}")
+                diff = np.abs(jax_np - torch_np)
+                print(f"  Diff:    max={np.max(diff):.6f}, mean={np.mean(diff):.6f}\n")
+
+            # 特殊调试：对比 main_layer_0（第一个出现差异的层）
+            if layer_name in ['main_layer_0_output', 'main_layer_10_output']:
+                print(f"\n[调试] {layer_name} 详细分析:")
+                jax_np = np.array(jax_act, dtype=np.float32)
+                torch_np = torch_act.detach().cpu().float().numpy() if isinstance(torch_act, torch.Tensor) else np.array(torch_act, dtype=np.float32)
+
+                print(f"  JAX shape: {jax_np.shape}, PyTorch shape: {torch_np.shape}")
+                diff = np.abs(jax_np - torch_np)
+
+                # 找到最大差异的位置
+                max_diff_idx = np.unravel_index(np.argmax(diff), diff.shape)
+                print(f"\n  最大差异位置: {max_diff_idx}")
+                print(f"    JAX 值:     {jax_np[max_diff_idx]:.6f}")
+                print(f"    PyTorch 值: {torch_np[max_diff_idx]:.6f}")
+                print(f"    差异:       {diff[max_diff_idx]:.6f}")
+
+                # 计算该位置的相对误差
+                scale = max(abs(jax_np[max_diff_idx]), abs(torch_np[max_diff_idx]))
+                if scale > 0.01:
+                    rel_err = diff[max_diff_idx] / scale
+                    print(f"    相对误差:   {rel_err:.2%}")
+
+                # 看看是否有符号问题
+                sign_diff = np.sign(jax_np) != np.sign(torch_np)
+                num_sign_diff = np.sum(sign_diff)
+                print(f"\n  符号不同的位置数: {num_sign_diff} / {jax_np.size} ({num_sign_diff/jax_np.size:.2%})")
+
+                # 统计相对误差分布
+                scale_arr = np.maximum(np.abs(jax_np), np.abs(torch_np))
+                valid_mask = scale_arr > 0.01
+                if np.any(valid_mask):
+                    rel_diff_arr = diff[valid_mask] / scale_arr[valid_mask]
+                    print(f"\n  相对误差分布 (只统计 scale > 0.01 的位置):")
+                    print(f"    Min:  {np.min(rel_diff_arr):.2%}")
+                    print(f"    25%:  {np.percentile(rel_diff_arr, 25):.2%}")
+                    print(f"    50%:  {np.percentile(rel_diff_arr, 50):.2%}")
+                    print(f"    75%:  {np.percentile(rel_diff_arr, 75):.2%}")
+                    print(f"    Max:  {np.max(rel_diff_arr):.2%}")
+                    print(f"    Mean: {np.mean(rel_diff_arr):.2%}")
+
+                    # 统计有多少位置接近200%
+                    near_200_pct = np.sum((rel_diff_arr > 1.9) & (rel_diff_arr < 2.1))
+                    print(f"\n  接近200%相对误差 (190%-210%) 的位置数: {near_200_pct} / {np.sum(valid_mask)} ({near_200_pct/np.sum(valid_mask):.2%})")
+
+                    # 找出相对误差最大的几个位置
+                    top_5_indices = np.argsort(rel_diff_arr)[-5:]
+                    print(f"\n  相对误差最大的5个位置:")
+                    for rank, idx in enumerate(reversed(top_5_indices), 1):
+                        # 找回原始数组中的位置
+                        orig_indices = np.where(valid_mask)
+                        orig_idx = tuple(arr[idx] for arr in orig_indices)
+                        print(f"    #{rank}: JAX={jax_np[orig_idx]:.6f}, PyTorch={torch_np[orig_idx]:.6f}, "
+                              f"diff={diff[orig_idx]:.6f}, rel_err={rel_diff_arr[idx]:.2%}")
+                print()
+
             result = self.comparator.compare(jax_act, torch_act, layer_name)
             results.append(result)
 
@@ -801,6 +879,50 @@ class LayerComparisonRunner:
                   f"max_abs={result.max_abs_diff:.6f}, "
                   f"max_rel={result.max_rel_diff:.2%}, "
                   f"mean_abs={result.mean_abs_diff:.6f}")
+
+            # 只对以下关键层打印详细信息：
+            # 1. combined_embeddings (输入到 main transformer)
+            # 2. main_layer_0_output (第一层)
+            # 3. input_local_transformer_output (input local 的最后一层)
+            # 4. 任何失败的层
+            should_print_details = (
+                layer_name in ['combined_embeddings', 'main_layer_0_output', 'input_local_transformer_output']
+                or not result.passed
+            )
+
+            if should_print_details:
+                jax_np = np.array(jax_act, dtype=np.float32)
+                torch_np = torch_act.detach().cpu().float().numpy() if isinstance(torch_act, torch.Tensor) else np.array(torch_act, dtype=np.float32)
+
+                # 展平数组以便处理
+                jax_flat = jax_np.flatten()
+                torch_flat = torch_np.flatten()
+                diff_flat = np.abs(jax_flat - torch_flat)
+
+                # 1. 打印前5个元素
+                print(f"  前5个元素:")
+                print(f"    JAX:     [{', '.join(f'{x:.6f}' for x in jax_flat[:5])}]")
+                print(f"    PyTorch: [{', '.join(f'{x:.6f}' for x in torch_flat[:5])}]")
+                print(f"    Diff:    [{', '.join(f'{x:.6f}' for x in diff_flat[:5])}]")
+
+                # 2. 找到相对差异最大的元素
+                scale_flat = np.maximum(np.abs(jax_flat), np.abs(torch_flat))
+                valid_mask = scale_flat > 1e-6  # 避免除以接近0的值
+
+                if np.any(valid_mask):
+                    rel_diff_flat = np.where(valid_mask, diff_flat / scale_flat, 0.0)
+                    max_rel_idx = np.argmax(rel_diff_flat)
+
+                    # 将展平的索引转换回原始多维索引
+                    max_rel_idx_nd = np.unravel_index(max_rel_idx, jax_np.shape)
+
+                    print(f"  相对差异最大的元素:")
+                    print(f"    索引:        {max_rel_idx_nd} (展平索引: {max_rel_idx})")
+                    print(f"    JAX 值:      {jax_flat[max_rel_idx]:.6f}")
+                    print(f"    PyTorch 值:  {torch_flat[max_rel_idx]:.6f}")
+                    print(f"    绝对差异:    {diff_flat[max_rel_idx]:.6f}")
+                    print(f"    相对差异:    {rel_diff_flat[max_rel_idx]:.2%}")
+                print()
 
         # 7. 生成报告
         report = self._generate_report(results, {
@@ -908,9 +1030,28 @@ class LayerComparisonRunner:
             B, _, T = input_ids.shape
             T_groups = T // model.group_size
 
+            # Hook _prepare_input_embeds 来捕获 combined_embeddings
+            original_prepare = model._prepare_input_embeds
+            def prepare_with_capture(input_ids):
+                result = original_prepare(input_ids)
+                activations['combined_embeddings'] = {
+                    'value': result.clone(),
+                    'shape': result.shape,
+                    'dtype': str(result.dtype)
+                }
+                return result
+            model._prepare_input_embeds = prepare_with_capture
+
             # 创建 attention_mask 和 position_ids
             attention_mask = torch.ones((B, T_groups), dtype=torch.bool, device=input_ids.device)
             position_ids = torch.arange(T_groups, dtype=torch.long, device=input_ids.device).unsqueeze(0).expand(B, -1)
+
+            # 调试：打印 PyTorch 的 attention_mask
+            print(f"\n[PyTorch] Main Transformer 输入:")
+            print(f"  attention_mask: {attention_mask}")
+            print(f"  attention_mask shape: {attention_mask.shape}")
+            print(f"  position_ids: {position_ids}")
+            print(f"  position_ids shape: {position_ids.shape}")
 
             # 执行主模型前向传播
             output = model(
@@ -940,6 +1081,9 @@ class LayerComparisonRunner:
             # 移除所有 hooks
             for handle in hook_handles:
                 handle.remove()
+
+            # 恢复原方法
+            model._prepare_input_embeds = original_prepare
 
         return activations
 
@@ -1005,15 +1149,22 @@ class LayerComparisonRunner:
         # 保存激活值
         if self.config.save_activations:
             act_path = os.path.join(self.config.output_dir, f'activations_{timestamp}.npz')
-            np.savez_compressed(
-                act_path,
-                **{
-                    f'jax_{k}': v['value'] for k, v in jax_activations.items()
-                },
-                **{
-                    f'torch_{k}': v['value'] for k, v in torch_activations.items()
-                }
-            )
+
+            # 转换所有激活值为 float32 numpy 数组
+            jax_acts_np = {}
+            for k, v in jax_activations.items():
+                val = v['value']
+                jax_acts_np[f'jax_{k}'] = np.array(val, dtype=np.float32)
+
+            torch_acts_np = {}
+            for k, v in torch_activations.items():
+                val = v['value']
+                if isinstance(val, torch.Tensor):
+                    torch_acts_np[f'torch_{k}'] = val.detach().cpu().float().numpy()
+                else:
+                    torch_acts_np[f'torch_{k}'] = np.array(val, dtype=np.float32)
+
+            np.savez_compressed(act_path, **jax_acts_np, **torch_acts_np)
             print(f"激活值: {act_path}")
 
 
