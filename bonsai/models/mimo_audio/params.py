@@ -37,7 +37,7 @@ def _get_qwen2_key_mapping(prefix: str, num_heads: int, num_kv_heads: int, emb_d
 def _get_mimo_key_mapping(audio_channels: int) -> dict[str, tuple[str, Transform]]:
     """Generate key mapping for MiMo-specific layers."""
     mapping = {
-        r"lm_head\.weight": ("model.lm_head.kernel", TRANSFORM_LINEAR),
+        r"lm_head\.weight": ("lm_head.kernel", TRANSFORM_LINEAR),
         r"hidden_states_downcast\.weight": ("hidden_states_downcast.kernel", TRANSFORM_LINEAR),
         r"speech_group_downcast\.weight": ("speech_group_downcast.kernel", TRANSFORM_LINEAR),
         r"speech_embeddings_to_local\.weight": ("speech_embeddings_to_local.kernel", TRANSFORM_LINEAR),

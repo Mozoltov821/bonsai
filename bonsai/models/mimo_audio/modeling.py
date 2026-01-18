@@ -76,7 +76,18 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         # Local/input transformers don't use their own embedders
         self.local_transformer.embedder = None
         self.input_local_transformer.embedder = None
-        self.lm_head = None  # Use model.lm_head instead
+
+        self.lm_head = shard(
+            nnx.Linear(
+                config.hidden_size,
+                config.vocab_size,
+                use_bias=False,
+                dtype=self.dtype,
+                rngs=rngs
+            ),
+            self.shd_cfg.emb_dv
+        )
+        self.model.lm_head = None  # Don't use Qwen2's lm_head
 
         self.local_transformer_lm_heads = nnx.List([
             shard(
@@ -232,7 +243,7 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         hidden_states = self.model.final_norm(x)  # [B, T_groups, hidden_size]
 
         # Compute text logits
-        text_logits = self.model.lm_head(hidden_states[:, -1:, :])  # [B, 1, vocab_size]
+        text_logits = self.lm_head(hidden_states[:, -1:, :])  # [B, 1, vocab_size]
 
         # Downcast hidden states for local transformer
         local_hidden_states = self.hidden_states_downcast(
