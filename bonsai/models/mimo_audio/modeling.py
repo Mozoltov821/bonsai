@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import jax
 import jax.numpy as jnp
 from flax import nnx
