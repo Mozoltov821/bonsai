@@ -10,11 +10,6 @@ from bonsai.models.qwen2.params import Transform, TRANSFORM_LINEAR, TRANSFORM_NO
 
 
 def _get_qwen2_key_mapping(prefix: str, num_heads: int, num_kv_heads: int, emb_dim: int, head_dim: int) -> dict[str, tuple[str, Transform]]:
-    """Generate key mapping for Qwen2 submodules with prefix."""
-    # Define transforms for attention weights - use Linear format (transpose only)
-    # Qwen2 uses nnx.Linear, so weights are (in_features, out_features) and bias is (out_features,)
-
-    # Bias transforms - flatten from (num_heads, head_dim) to (num_heads * head_dim,)
     q_bias_flatten = Transform(reshape=(-1,))
     kv_bias_flatten = Transform(reshape=(-1,))
 
@@ -62,7 +57,6 @@ def _get_jax_key(
     for pat, (jax_key, transform) in mapping.items():
         match = re.fullmatch(pat, source_key)
         if match:
-            # Use re.sub to handle backreferences like \1
             result_key = re.sub(pat, jax_key, source_key)
             return result_key, transform
     return None, None
@@ -73,8 +67,8 @@ def create_model_with_weights(
     config,
     args,
     rngs: nnx.Rngs | None = None,
-    dtype: Any = jnp.bfloat16,  # ✅ 恢复：默认bfloat16节省内存，关键部分特殊处理
-    mesh: jax.sharding.Mesh | None = None,  # Add mesh parameter for sharding
+    dtype: Any = jnp.bfloat16,
+    mesh: jax.sharding.Mesh | None = None,
 ) -> Any:
     """Create MiMo Audio model and load weights from safetensors."""
     import os
@@ -156,7 +150,6 @@ def create_model_with_weights(
 
         keys = [_stoi(k) for k in jax_key.split(".")]
         try:
-            # ✅ 修复：使用传入的dtype而不是硬编码bfloat16
             tensor_jax = jnp.asarray(tensor, dtype=dtype)
             _assign_weights(keys, tensor_jax, pure_state_dict, torch_key, transform, sharding)
             loaded_count += 1

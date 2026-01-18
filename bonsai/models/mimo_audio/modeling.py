@@ -17,7 +17,6 @@ class MiMoSampler:
 
     def __init__(self, config: MiMoSamplerConfig):
         self.config = config
-        # 根据config创建对应的utils sampler
         if config.do_sample:
             self._sampler = Sampler(
                 temperature=config.temperature,
@@ -33,20 +32,13 @@ class MiMoSampler:
             key: jax.random.PRNGKey,
             removed_tokens: Optional[List[int]] = None
     ) -> jnp.ndarray:
-        """Sample next token from logits
-
-        Wrapper around utils.samplers with removed_tokens support.
-        """
-        # 1. Handle removed_tokens (MiMo特有功能)
+        """Sample next token from logits with optional token filtering"""
         if removed_tokens:
             for t in removed_tokens:
                 logits = logits.at[:, t].set(-jnp.inf)
 
-        # 2. Call utils sampler
         result = self._sampler(logits, key=key)  # [B, 1]
-
-        # 3. Reshape to match original API: [B, 1] → [B]
-        return result[:, 0]
+        return result[:, 0]  # [B]
 
 
 class FlaxMiMoAudioForCausalLM(nnx.Module):
@@ -55,16 +47,17 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
             config: MiMoAudioConfig,
             args: MiMoAudioArguments,
             rngs: Optional[nnx.Rngs] = None,
-            dtype: jnp.dtype = jnp.bfloat16,  # ✅ 恢复：默认bfloat16节省内存
+            dtype: jnp.dtype = jnp.bfloat16,
     ):
         if rngs is None:
             rngs = nnx.Rngs(0)
 
         self.config = config
         self.args = args
-        self.shd_cfg = config.shd_cfg  # Store sharding config
+        self.dtype = dtype
+        self.shd_cfg = config.shd_cfg
 
-        # Fixed speech configurations (based on actual model)
+        # Fixed model-specific configurations
         self.speech_vocab_sizes = [1025, 1025, 129, 129, 129, 129, 129, 129]
         self.speech_empty_ids = [1024, 1024, 128, 128, 128, 128, 128, 128]
         self.delay_pattern = [0, 1, 2, 3, 4, 5, 6, 7]
@@ -72,31 +65,26 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         self.group_size = config.group_size
         self.audio_channels = config.audio_channels
 
-        # Create Qwen2 configurations
         self.qwen2_config = config.create_qwen2_config()
         self.local_qwen2_config = config.create_local_qwen2_config()
         self.input_local_qwen2_config = config.create_input_local_qwen2_config()
 
-        # Initialize Qwen2 models
         self.model = Qwen2(self.qwen2_config, rngs=rngs)
         self.local_transformer = Qwen2(self.local_qwen2_config, rngs=rngs)
         self.input_local_transformer = Qwen2(self.input_local_qwen2_config, rngs=rngs)
 
-        # Keep the main model's embedder for text token embedding
+        # Local/input transformers don't use their own embedders
         self.local_transformer.embedder = None
         self.input_local_transformer.embedder = None
+        self.lm_head = None  # Use model.lm_head instead
 
-        # Text LM head (note: not used, model.lm_head is used instead)
-        self.lm_head = None
-
-        # Local transformer LM heads for each audio channel
         self.local_transformer_lm_heads = nnx.List([
             shard(
                 nnx.Linear(
                     config.local_dim,
                     self.speech_vocab_sizes[i],
                     use_bias=False,
-                    dtype=dtype,  # ✅ 使用传入的dtype而不是硬编码bfloat16
+                    dtype=self.dtype,
                     rngs=rngs
                 ),
                 self.shd_cfg.emb_dv
@@ -104,15 +92,12 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
             for i in range(self.audio_channels)
         ])
 
-        # Speech embeddings for each audio channel
-        # ⚠️  关键：使用float32保持累加精度，避免tokens重复
-        # PyTorch实现中embeddings累加也保持较高精度
         self.speech_embeddings = nnx.List([
             shard(
                 nnx.Embed(
                     self.speech_vocab_sizes[i],
                     config.input_local_dim,
-                    dtype=jnp.float32,  # 使用float32保持累加精度
+                    dtype=self.dtype,
                     rngs=rngs
                 ),
                 self.shd_cfg.emb_vd
@@ -120,25 +105,23 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
             for i in range(self.audio_channels)
         ])
 
-        # Group downcast for combining speech groups
         self.speech_group_downcast = shard(
             nnx.Linear(
                 config.input_local_dim * config.group_size,
                 config.hidden_size,
                 use_bias=False,
-                dtype=jnp.bfloat16,
+                dtype=self.dtype,
                 rngs=rngs
             ),
             self.shd_cfg.ffw_weight_df
         )
 
-        # Hidden states downcast for local transformer
         self.hidden_states_downcast = shard(
             nnx.Linear(
                 config.hidden_size,
                 config.local_dim,
                 use_bias=False,
-                dtype=jnp.bfloat16,
+                dtype=self.dtype,
                 rngs=rngs
             ),
             self.shd_cfg.ffw_weight_df
@@ -146,117 +129,77 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
 
     def apply_input_local_transformer(
             self,
-            speech_embeddings: jnp.ndarray,  # [B, T_groups, group_size, hidden_size]
+            speech_embeddings: jnp.ndarray,
             cache: Optional[Cache] = None
     ) -> jnp.ndarray:
-        """
-        Apply input local transformer to speech embeddings.
-
-        Args:
-            speech_embeddings: [B, T_groups, group_size, hidden_size]
-            cache: Optional KV cache (not used during prefill)
-
-        Returns:
-            Encoded embeddings [B, T_groups, group_size, hidden_size]
-        """
+        """Apply input local transformer to speech embeddings"""
         B, T_groups, group_size, hidden_size = speech_embeddings.shape
 
-        # Ensure correct dtype (bfloat16 for efficiency)
-        speech_embeddings = speech_embeddings.astype(jnp.bfloat16)
-
-        # Process each group independently
         input_embeddings = speech_embeddings.reshape(B * T_groups, group_size, hidden_size)
-
-        # Create segment IDs (all 1s for valid tokens)
         segment_ids = jnp.ones((B * T_groups, group_size), dtype=jnp.int32)
 
-        # Create cache if not provided (for standalone processing)
         if cache is None:
             cache = self.input_local_transformer.init_cache(
                 self.input_local_qwen2_config,
                 B * T_groups,
                 group_size,
                 generate_steps=0,
-                dtype=jnp.bfloat16
+                dtype=self.dtype
             )
 
-        # Run through input local transformer layers
         x = input_embeddings
         for i, layer in enumerate(self.input_local_transformer.layers):
             x = layer(x, cache[i], segment_ids)
         x = self.input_local_transformer.final_norm(x)
 
-        # Reshape back to original format
-        encoded_embeddings = x.reshape(B, T_groups, group_size, hidden_size)
-
-        return encoded_embeddings
+        return x.reshape(B, T_groups, group_size, hidden_size)
 
     def _prepare_input_embeds(
             self,
-            input_ids: jnp.ndarray,  # [B, audio_channels + 1, new_T]
+            input_ids: jnp.ndarray,
             text_embed_fn
     ) -> jnp.ndarray:
-        """
-        Prepare input embeddings from interleaved text and speech tokens.
-
-        Args:
-            input_ids: [B, audio_channels + 1, new_T]
-            text_embed_fn: Function to embed text tokens
-
-        Returns:
-            Combined embeddings [B, T_groups, hidden_size]
-        """
+        """Prepare input embeddings from interleaved text and speech tokens"""
         B = input_ids.shape[0]
 
-        # Extract text and speech tokens
-        text_input_ids = input_ids[:, 0, ::self.group_size]  # [B, T_groups]
+        text_input_ids = input_ids[:, 0, ::self.group_size]
         speech_input_ids = input_ids[:, 1:, :].reshape(
             B, self.audio_channels, -1, self.group_size
-        ).transpose(0, 2, 1, 3)  # [B, T_groups, audio_channels, group_size]
+        ).transpose(0, 2, 1, 3)
 
-        is_speech = text_input_ids == self.args.empty_idx  # [B, T_groups]
+        is_speech = text_input_ids == self.args.empty_idx
 
-        # Initialize speech embeddings
         speech_embeds = jnp.zeros(
             (B, is_speech.shape[1], self.group_size, self.config.input_local_dim),
-            dtype=jnp.bfloat16
+            dtype=self.dtype
         )
 
-        # Sum embeddings from all audio channels
         for idx in range(self.audio_channels):
             cur_empty = self.speech_empty_ids[idx]
             cur_embed = self.speech_embeddings[idx]
-            cur_speech_ids = speech_input_ids[:, :, idx, :]  # [B, T_groups, group_size]
-            cur_speech_embeds = cur_embed(cur_speech_ids)  # [B, T_groups, group_size, hidden_size]
+            cur_speech_ids = speech_input_ids[:, :, idx, :]
+            cur_speech_embeds = cur_embed(cur_speech_ids)
 
-            # Mask out empty tokens
             cur_mask = cur_speech_ids == cur_empty
             cur_speech_embeds = cur_speech_embeds * ~cur_mask[..., None]
-
             speech_embeds = speech_embeds + cur_speech_embeds
 
-        # Mask non-speech positions
         speech_embeds = speech_embeds * is_speech[:, :, None, None]
-
-        # Apply input_local_transformer (pass None for cache during prefill)
         speech_embeds = self.apply_input_local_transformer(speech_embeds, cache=None)
 
-        # ✅ 关键修复：apply_input_local_transformer 后再次 mask（与官方实现一致）
+        # IMPORTANT: Mask again after input_local_transformer (matches official implementation)
         speech_embeds = speech_embeds * is_speech[:, :, None, None]
 
         T_groups = speech_embeds.shape[1]
-        # Flatten group dimension and project
         speech_grouped_embeds = self.speech_group_downcast(
             speech_embeds.reshape(B, T_groups, -1)
-        )  # [B, T_groups, hidden_size]
+        )
 
-        # Get text embeddings
-        # ✅ 关键修复：处理 -100 padding tokens
-        # 将 -100 替换为 0（或任何有效索引），因为我们会mask掉这些位置
+        # Handle -100 padding tokens: replace with valid index (will be masked out)
         text_input_ids_safe = jnp.where(text_input_ids == -100, 0, text_input_ids)
-        text_embeds = text_embed_fn(text_input_ids_safe)  # [B, T_groups, hidden_size]
+        text_embeds = text_embed_fn(text_input_ids_safe)
 
-        # Mask掉 empty_idx 和 -100 的位置
+        # Mask empty_idx and -100 positions
         text_zero_mask = (text_input_ids == self.args.empty_idx) | (text_input_ids == -100)
         text_embeds = text_embeds * ~text_zero_mask[..., None]
 
@@ -265,41 +208,25 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
 
     def forward(
             self,
-            input_ids: jnp.ndarray,  # [B, audio_channels + 1, new_T]
+            input_ids: jnp.ndarray,
             cache: Cache,
             pad_id: int = 0,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """
-        Forward pass through the model.
+        """Forward pass through the model"""
+        text_input_ids = input_ids[:, 0, ::self.group_size]
 
-        Args:
-            input_ids: [B, audio_channels + 1, new_T]
-            cache: KV cache for main transformer
-            pad_id: Padding token ID
-
-        Returns:
-            text_logits: [B, 1, vocab_size]
-            local_hidden_states: [B, 1, local_dim]
-        """
-        # Get text token IDs for embedding
-        text_input_ids = input_ids[:, 0, ::self.group_size]  # [B, T_groups]
-
-        # Get text embeddings using the main model's embedder
         def text_embed_fn(x):
             return self.model.embedder.embedding.value[x]
 
-        # Prepare combined text+speech embeddings
         inputs_embeds = self._prepare_input_embeds(input_ids, text_embed_fn)
 
-        # Create segment IDs
-        # ✅ 关键修复：只mask -100 padding，empty_idx是有意义的token不应该被mask
-        # 官方使用全1的attention_mask，不mask empty_idx位置
-        # -100在::group_size采样后不应出现在text_input_ids中，但为了安全仍然检查
+        # IMPORTANT: Only mask -100 padding, not empty_idx (which is meaningful)
+        # Official implementation uses all-ones attention_mask (no masking of empty_idx)
         B, T_groups, _ = inputs_embeds.shape
-        segment_ids = 1 * (text_input_ids != -100)  # [B, T_groups] - 只mask -100，不mask empty_idx
+        segment_ids = 1 * (text_input_ids != -100)
 
-        # Run through main transformer (ensure bfloat16)
-        x = inputs_embeds.astype(jnp.bfloat16)
+        # Run through main transformer
+        x = inputs_embeds
         for i, layer in enumerate(self.model.layers):
             x = layer(x, cache[i], segment_ids)
         hidden_states = self.model.final_norm(x)  # [B, T_groups, hidden_size]
@@ -342,43 +269,36 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         if local_sampler is None:
             local_sampler = MiMoSampler(MiMoSamplerConfig())
 
-        # ✅ 关键修复：每次调用都创建新的 cache（与官方实现一致）
-        # 官方实现：past_key_values = DynamicCache() 每次都是新的
-        # token_len=1: 每次迭代只输入1个token
-        # generate_steps: 总共需要delay_iters个位置，已有1个，还需delay_iters-1个
+        # IMPORTANT: Create new cache each time (matches official implementation)
+        # Official: past_key_values = DynamicCache() creates new cache every time
         cache = self.local_transformer.init_cache(
             self.local_qwen2_config,
             B,
-            token_len=1,  # 每次只输入1个token
-            generate_steps=delay_iters - 1,  # 还需要生成delay_iters-1个token的空间
-            dtype=jnp.bfloat16,
+            token_len=1,
+            generate_steps=delay_iters - 1,
+            dtype=self.dtype,
         )
 
-        # Create segment IDs
         segment_ids = jnp.ones((B, 1), dtype=jnp.int32)
 
         for t in range(delay_iters):
-            # ✅ 使用 JIT 编译的 transformer forward（加速核心计算）
-            # 必须返回 cache 以确保状态正确更新
+            # Use JIT-compiled transformer forward for acceleration
+            # Must return cache to ensure correct state updates
             hidden_state, cache = _local_transformer_step_jit(
                 self.local_transformer, local_embeds, cache, segment_ids
-            )  # [B, 1, local_dim]
+            )
 
-            # Reset embeddings for next iteration
             next_local_embeds = jnp.zeros_like(local_embeds)
 
-            # Generate token for each channel based on delay pattern
             for idx in range(self.audio_channels):
                 cur_start = self.delay_pattern[idx]
                 cur_end = cur_start + self.group_size
                 cur_empty = self.speech_empty_ids[idx]
 
                 if cur_start <= t < cur_end:
-                    # Compute logits for this channel
                     cur_lm_head = self.local_transformer_lm_heads[idx]
-                    cur_logits = cur_lm_head(hidden_state[:, -1, :])  # [B, vocab_size]
+                    cur_logits = cur_lm_head(hidden_state[:, -1, :])
 
-                    # Sample token
                     key, subkey = jax.random.split(key)
                     cur_token = local_sampler.sample(
                         cur_logits,
@@ -386,12 +306,9 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
                         removed_tokens=[cur_empty]
                     )
 
-                    # Store token
                     local_tokens = local_tokens.at[:, t - cur_start, idx].set(cur_token)
 
-                    # Get embedding for next iteration
-                    # Add sequence dimension: [B] -> [B, 1] before embedding
-                    cur_input_embed = self.speech_embeddings[idx](cur_token[:, None])  # [B, 1, embed_dim]
+                    cur_input_embed = self.speech_embeddings[idx](cur_token[:, None])
 
                     next_local_embeds = next_local_embeds + cur_input_embed
 
@@ -437,18 +354,14 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
         cur_len = input_ids.shape[1] // (self.group_size * (self.audio_channels + 1))
 
         # Initialize KV cache for main transformer
-        # ✅ 关键修复：不再为 local_transformer 预先创建 cache
-        # local_forward 会在内部创建自己的 cache（每次都是新的）
         token_len = cur_len
         generate_steps = max_length - cur_len
 
         main_cache = self.model.init_cache(
-            self.qwen2_config, B, token_len, generate_steps, dtype=jnp.bfloat16
+            self.qwen2_config, B, token_len, generate_steps, dtype=self.dtype
         )
 
         while cur_len < max_length:
-            # Prepare model inputs
-            # [B, (audio_channels + 1) * group_size * T] -> [B, audio_channels + 1, T * group_size]
             model_input_ids = input_ids.reshape(
                 B, -1, (self.audio_channels + 1) * self.group_size
             ).transpose(0, 2, 1).reshape(B, self.audio_channels + 1, -1)
@@ -541,7 +454,7 @@ def _local_transformer_step_jit(
         hidden_state: [B, 1, local_dim]
         cache: Updated cache (IMPORTANT for correct behavior)
     """
-    x = local_embeds.astype(jnp.bfloat16)
+    x = local_embeds
     for i, layer in enumerate(local_transformer.layers):
         x = layer(x, cache[i], segment_ids)
     hidden_state = local_transformer.final_norm(x)
