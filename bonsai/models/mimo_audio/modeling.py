@@ -120,21 +120,6 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
             for i in range(self.audio_channels)
         ])
 
-        # Projection from input_local_dim to local_dim if different
-        if config.input_local_dim != config.local_dim:
-            self.speech_embeddings_to_local = shard(
-                nnx.Linear(
-                    config.input_local_dim,
-                    config.local_dim,
-                    use_bias=False,
-                    dtype=dtype,  # ✅ 使用传入的dtype而不是硬编码bfloat16
-                    rngs=rngs
-                ),
-                self.shd_cfg.ffw_weight_df
-            )
-        else:
-            self.speech_embeddings_to_local = None
-
         # Group downcast for combining speech groups
         self.speech_group_downcast = shard(
             nnx.Linear(
@@ -407,8 +392,6 @@ class FlaxMiMoAudioForCausalLM(nnx.Module):
                     # Get embedding for next iteration
                     # Add sequence dimension: [B] -> [B, 1] before embedding
                     cur_input_embed = self.speech_embeddings[idx](cur_token[:, None])  # [B, 1, embed_dim]
-                    if self.speech_embeddings_to_local is not None:
-                        cur_input_embed = self.speech_embeddings_to_local(cur_input_embed)
 
                     next_local_embeds = next_local_embeds + cur_input_embed
 
